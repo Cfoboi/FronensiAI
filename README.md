@@ -1,70 +1,32 @@
-# GitHub Codespaces ♥️ React
+# Evidence Locker
 
-Welcome to your shiny new Codespace running React! We've got everything fired up and running for you to explore React.
+A browser-local evidence catalog for organizing files by case ID, calculating SHA-256 fingerprints, and recording timestamped custody events.
 
-You've got a blank canvas to work on from a git perspective as well. There's a single initial commit with the what you're seeing right now - where you go from here is up to you!
+## Run locally
 
-Everything you do here is contained within this one codespace. There is no repository on GitHub yet. If and when you’re ready you can click "Publish Branch" and we’ll create your repository and push up your project. If you were just exploring then and have no further need for this code then you can simply delete your codespace and it's gone forever.
+```sh
+npm install
+npm start
+```
 
-This project was bootstrapped for you with [Vite](https://vitejs.dev/).
+Open `http://localhost:3000`. Browser cryptography requires a secure context, which localhost provides.
 
-## Available Scripts
+## Evidence handling
 
-In the project directory, you can run:
+- Files are associated with the case ID entered in the locker and encrypted with AES-GCM using a 256-bit, non-extractable Web Crypto key.
+- Encrypted files, metadata, custody events, and the key are stored in this browser's IndexedDB. Evidence is not sent to a server or synchronized between browsers.
+- SHA-256 is calculated before encryption and checked again before a file is decrypted for download.
+- Custody entries include a timestamp, custodian, action, previous-event hash, and event hash. The interface verifies the event links when a record is selected.
+- Extracted metadata includes the file name, media type, size, last-modified time, image/video dimensions, audio/video duration, and PDF version where available.
 
-### `npm start`
+This is a local catalog, not a tamper-proof or court-certified evidence management system. The encryption key is stored in the same browser profile as the encrypted records, so scripts running on this origin can access the vault. Clearing site data or losing the browser profile can make records unrecoverable. Use a managed server-side evidence system when you need centralized access control, independent key custody, durable backups, or legally auditable records.
 
-We've already run this for you in the `Codespaces: server` terminal window below. If you need to stop the server for any reason you can just run `npm start` again to bring it back online.
+## Supabase Phase 1
 
-Runs the app in the development mode.\
-Open [http://localhost:3000/](http://localhost:3000/) in the built-in Simple Browser (`Cmd/Ctrl + Shift + P > Simple Browser: Show`) to view your running application.
+The optional Supabase Auth panel is enabled when `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` are set. Copy `.env.example` to `.env.local`; the local environment file is gitignored. The publishable key is intended for browser use. Never put a service-role key, secret key, or database password in a `VITE_` variable.
 
-The page will reload automatically when you make changes.\
-You may also see any lint errors in the console.
+Apply `supabase/migrations/20261030000000_forensiai_team_phase1.sql` to a Supabase project to create team cases, Admin/Investigator/Viewer membership roles, encrypted key envelopes, hash and custody tables, RLS, and a private evidence bucket. The migration adds no evidence rows and does not upload files. Remote evidence upload, local-vault migration, vault-passphrase onboarding, and case-management UI remain disabled for this phase.
 
-### `npm test`
+The key-sharing primitives in `src/supabase/key-sharing.js` generate a per-member RSA key pair, encrypt the private key under a separate vault passphrase, and wrap a case AES key to each authorized member's public key. Teammates unwrap with their own private key; personal passwords are not shared. The database stores public keys and passphrase-encrypted private-key envelopes, never passphrases or clear private keys.
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
-
-### `npm run build`
-
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
-
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
-
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
-
-## Learn More
-
-You can learn more in the [Vite documentation](https://vitejs.dev/guide/).
-
-To learn Vitest, a Vite-native testing framework, go to [Vitest documentation](https://vitest.dev/guide/)
-
-To learn React, check out the [React documentation](https://reactjs.org/).
-
-### Code Splitting
-
-This section has moved here: [https://sambitsahoo.com/blog/vite-code-splitting-that-works.html](https://sambitsahoo.com/blog/vite-code-splitting-that-works.html)
-
-### Analyzing the Bundle Size
-
-This section has moved here: [https://github.com/btd/rollup-plugin-visualizer#rollup-plugin-visualizer](https://github.com/btd/rollup-plugin-visualizer#rollup-plugin-visualizer)
-
-### Making a Progressive Web App
-
-This section has moved here: [https://dev.to/hamdankhan364/simplifying-progressive-web-app-pwa-development-with-vite-a-beginners-guide-38cf](https://dev.to/hamdankhan364/simplifying-progressive-web-app-pwa-development-with-vite-a-beginners-guide-38cf)
-
-### Advanced Configuration
-
-This section has moved here: [https://vitejs.dev/guide/build.html#advanced-base-options](https://vitejs.dev/guide/build.html#advanced-base-options)
-
-### Deployment
-
-This section has moved here: [https://vitejs.dev/guide/build.html](https://vitejs.dev/guide/build.html)
-
-### Troubleshooting
-
-This section has moved here: [https://vitejs.dev/guide/troubleshooting.html](https://vitejs.dev/guide/troubleshooting.html)
+RLS regression tests are in `supabase/tests/database/rls.test.sql` and are intended to run with Supabase CLI `supabase test db` against a disposable local Supabase stack. Do not apply migrations to production until the migration and policies have been reviewed and tested in a separate project.
