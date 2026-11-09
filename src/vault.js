@@ -1,7 +1,7 @@
 import { extractExifMetadata } from './exif';
 
 const DATABASE_NAME = 'evidence-locker-private';
-const DATABASE_VERSION = 1;
+const DATABASE_VERSION = 2;
 const KEY_ID = 'evidence-encryption-key';
 const EXIF_VALIDATION_STATUSES = ['VERIFIED', 'MISMATCH', 'NEEDS REVIEW'];
 const REGISTRY_VALIDATION_STATUSES = ['VERIFIED', 'MISMATCH', 'NEEDS REVIEW'];
@@ -16,9 +16,16 @@ export function openVault() {
     const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
     request.onupgradeneeded = () => {
       const database = request.result;
-      const records = database.createObjectStore('records', { keyPath: 'id' });
-      records.createIndex('caseId', 'caseId', { unique: false });
-      database.createObjectStore('keys', { keyPath: 'id' });
+      if (!database.objectStoreNames.contains('records')) {
+        const records = database.createObjectStore('records', { keyPath: 'id' });
+        records.createIndex('caseId', 'caseId', { unique: false });
+      }
+      if (!database.objectStoreNames.contains('keys')) {
+        database.createObjectStore('keys', { keyPath: 'id' });
+      }
+      if (!database.objectStoreNames.contains('cases')) {
+        database.createObjectStore('cases', { keyPath: 'caseId' });
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error || new Error('Could not open private browser storage.'));
@@ -41,6 +48,34 @@ function putRecord(database, storeName, value) {
     transaction.oncomplete = () => resolve(result);
     transaction.onerror = () => reject(transaction.error || new Error('Browser storage write failed.'));
     transaction.onabort = () => reject(transaction.error || new Error('Browser storage write was interrupted.'));
+  });
+}
+
+function sameEncryptedValue(left, right) {
+  if (!left || !right || JSON.stringify(left.iv) !== JSON.stringify(right.iv)) return false;
+  const leftBytes = new Uint8Array(left.ciphertext);
+  const rightBytes = new Uint8Array(right.ciphertext);
+  return leftBytes.length === rightBytes.length && leftBytes.every((byte, index) => byte === rightBytes[index]);
+}
+
+function commitEvidenceMutation(database, originalRecord, expectedMetadata, newRecord = null) {
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction('records', 'readwrite');
+    const store = transaction.objectStore('records');
+    let failure;
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(failure || transaction.error || new Error('Evidence records could not be updated.'));
+    transaction.onabort = () => reject(failure || transaction.error || new Error('Evidence record update was interrupted.'));
+    const request = store.get(originalRecord.id);
+    request.onsuccess = () => {
+      if (!request.result || !sameEncryptedValue(request.result.metadata, expectedMetadata)) {
+        failure = new Error('Evidence changed during this action. Reload the case and review the record before retrying.');
+        transaction.abort();
+        return;
+      }
+      store.put(originalRecord);
+      if (newRecord) store.add(newRecord);
+    };
   });
 }
 
@@ -67,17 +102,19 @@ async function hashHex(bytes) {
   return Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-function makeEventHash({ timestamp, actor, action, previousHash }) {
-  return hashHex(encoder.encode(`${timestamp}|${actor}|${action}|${previousHash}`));
+function makeEventHash({ timestamp, actor, action, previousHash, details }) {
+  const serializedDetails = details === undefined ? '' : `|${JSON.stringify(details)}`;
+  return hashHex(encoder.encode(`${timestamp}|${actor}|${action}|${previousHash}${serializedDetails}`));
 }
 
-async function createCustodyEvent(custody, actor, action) {
+async function createCustodyEvent(custody, actor, action, details, timestamp = new Date().toISOString()) {
   const event = {
-    timestamp: new Date().toISOString(),
+    timestamp,
     actor,
     action,
     previousHash: custody.at(-1)?.eventHash || 'GENESIS',
   };
+  if (details) event.details = details;
   event.eventHash = await makeEventHash(event);
   return event;
 }
@@ -141,6 +178,151 @@ export async function saveEvidence(database, { file, caseId, custodian }) {
   return id;
 }
 
+function validateEvidenceDisposition({ analyst, reason }) {
+  if (typeof analyst !== 'string' || !analyst.trim() || analyst.trim().length > 200) {
+    throw new Error('Enter the analyst name (up to 200 characters).');
+  }
+  if (typeof reason !== 'string' || !reason.trim() || reason.trim().length > 5000) {
+    throw new Error('Enter a reason (up to 5,000 characters).');
+  }
+}
+
+async function readRecordAndMetadata(database, id) {
+  const record = await requestResult(database.transaction('records', 'readonly').objectStore('records').get(id));
+  if (!record) throw new Error('Evidence record was not found.');
+  const key = await getEncryptionKey(database);
+  const metadata = JSON.parse(decoder.decode(await decryptBytes(key, record.metadata)));
+  if (!Array.isArray(metadata.custody) || !metadata.custody.length) {
+    throw new Error('Evidence custody history is missing or invalid; the record was not changed.');
+  }
+  return { record, metadata, key };
+}
+
+function assertEvidenceIsActive(metadata) {
+  if (metadata.archivedAt) {
+    throw new Error('Archived evidence is read-only and cannot receive new analysis or custody changes.');
+  }
+}
+
+export async function archiveEvidenceRecord(database, id, { analyst, reason, userId = null } = {}) {
+  validateEvidenceDisposition({ analyst, reason });
+  const { record, metadata, key } = await readRecordAndMetadata(database, id);
+  if (metadata.archivedAt) throw new Error('Evidence is already archived.');
+
+  const expectedMetadata = record.metadata;
+  const timestamp = new Date().toISOString();
+  const normalizedAnalyst = analyst.trim();
+  const normalizedReason = reason.trim();
+  const details = {
+    action: 'remove_from_case',
+    analyst: normalizedAnalyst,
+    userId,
+    reason: normalizedReason,
+    originalEvidenceId: id,
+    replacementEvidenceId: null,
+  };
+  metadata.archivedAt = timestamp;
+  metadata.archive = {
+    action: 'removed',
+    analyst: normalizedAnalyst,
+    userId,
+    reason: normalizedReason,
+    originalEvidenceId: id,
+    replacementEvidenceId: null,
+  };
+  metadata.custody.push(await createCustodyEvent(
+    metadata.custody,
+    normalizedAnalyst,
+    'Evidence removed from case',
+    details,
+    timestamp,
+  ));
+  record.metadata = await encryptBytes(key, encoder.encode(JSON.stringify(metadata)));
+  await commitEvidenceMutation(database, record, expectedMetadata);
+  return { id, archivedAt: timestamp };
+}
+
+export async function replaceEvidence(database, originalId, { file, analyst, reason, userId = null } = {}) {
+  validateEvidenceDisposition({ analyst, reason });
+  if (!file || typeof file.arrayBuffer !== 'function') {
+    throw new Error('Choose a replacement evidence file.');
+  }
+  const { record: originalRecord, metadata: originalMetadata, key } = await readRecordAndMetadata(database, originalId);
+  if (originalMetadata.archivedAt) throw new Error('Archived evidence cannot be replaced.');
+
+  const expectedMetadata = originalRecord.metadata;
+  const timestamp = new Date().toISOString();
+  const normalizedAnalyst = analyst.trim();
+  const normalizedReason = reason.trim();
+  const replacementId = crypto.randomUUID();
+  const details = {
+    action: 'replace_evidence',
+    analyst: normalizedAnalyst,
+    userId,
+    reason: normalizedReason,
+    originalEvidenceId: originalId,
+    replacementEvidenceId: replacementId,
+  };
+  const fileBytes = await file.arrayBuffer();
+  const replacementMetadata = {
+    name: file.name,
+    type: file.type,
+    size: file.size,
+    lastModified: file.lastModified ? new Date(file.lastModified).toISOString() : timestamp,
+    sha256: await hashHex(fileBytes),
+    exif: extractExifMetadata(fileBytes),
+    ...await extractMediaMetadata(file),
+    custody: [],
+    replacement: {
+      originalEvidenceId: originalId,
+      replacedAt: timestamp,
+      analyst: normalizedAnalyst,
+      userId,
+      reason: normalizedReason,
+    },
+  };
+  replacementMetadata.custody.push(await createCustodyEvent(
+    [],
+    normalizedAnalyst,
+    'Evidence received as replacement',
+    details,
+    timestamp,
+  ));
+  const [replacementFile, encryptedReplacementMetadata] = await Promise.all([
+    encryptBytes(key, fileBytes),
+    encryptBytes(key, encoder.encode(JSON.stringify(replacementMetadata))),
+  ]);
+  const replacementRecord = {
+    id: replacementId,
+    caseId: originalRecord.caseId,
+    createdAt: timestamp,
+    file: replacementFile,
+    metadata: encryptedReplacementMetadata,
+  };
+
+  originalMetadata.archivedAt = timestamp;
+  originalMetadata.archive = {
+    action: 'replaced',
+    analyst: normalizedAnalyst,
+    userId,
+    reason: normalizedReason,
+    originalEvidenceId: originalId,
+    replacementEvidenceId: replacementId,
+  };
+  originalMetadata.replacementEvidenceId = replacementId;
+  originalMetadata.custody.push(await createCustodyEvent(
+    originalMetadata.custody,
+    normalizedAnalyst,
+    'Evidence replaced',
+    details,
+    timestamp,
+  ));
+  originalRecord.metadata = await encryptBytes(key, encoder.encode(JSON.stringify(originalMetadata)));
+
+  await commitEvidenceMutation(database, originalRecord, expectedMetadata, replacementRecord);
+  return replacementId;
+}
+
 export async function getCaseRecords(database, caseId) {
   const key = await getEncryptionKey(database);
   const storedRecords = await requestResult(database.transaction('records', 'readonly').objectStore('records').index('caseId').getAll(caseId));
@@ -153,7 +335,68 @@ export async function getCaseRecords(database, caseId) {
 
 export async function getCases(database) {
   const storedRecords = await requestResult(database.transaction('records', 'readonly').objectStore('records').getAll());
-  return [...new Set(storedRecords.map((record) => record.caseId))].sort();
+  const storedCases = await requestResult(database.transaction('cases', 'readonly').objectStore('cases').getAll());
+  return [...new Set([
+    ...storedRecords.map((record) => record.caseId),
+    ...storedCases.map((record) => record.caseId),
+  ])].sort();
+}
+
+export async function getCaseDetails(database, caseId) {
+  const stored = await requestResult(database.transaction('cases', 'readonly').objectStore('cases').get(caseId));
+  if (stored?.details) {
+    const key = await getEncryptionKey(database);
+    return JSON.parse(decoder.decode(await decryptBytes(key, stored.details)));
+  }
+  const records = await requestResult(database.transaction('records', 'readonly').objectStore('records').index('caseId').getAll(caseId));
+  const createdAt = records.reduce(
+    (earliest, record) => record.createdAt < earliest ? record.createdAt : earliest,
+    records[0]?.createdAt || new Date().toISOString(),
+  );
+  return {
+    caseId,
+    title: '',
+    leadInvestigator: '',
+    description: '',
+    status: 'Open',
+    createdAt,
+    updatedAt: createdAt,
+  };
+}
+
+export async function saveCaseDetails(database, caseDetails) {
+  const { caseId, title, leadInvestigator, description, status } = caseDetails;
+  if (typeof caseId !== 'string' || !caseId.trim()) throw new Error('A case ID is required.');
+  if (typeof title !== 'string' || typeof leadInvestigator !== 'string' || typeof description !== 'string') {
+    throw new Error('Enter valid case details before saving.');
+  }
+  if (title.length > 200 || leadInvestigator.length > 200 || description.length > 10000) {
+    throw new Error('Case details exceed the allowed length.');
+  }
+  if (!['Open', 'In Progress', 'Under Review', 'Closed'].includes(status)) {
+    throw new Error('Choose a valid case status.');
+  }
+
+  const stored = await requestResult(database.transaction('cases', 'readonly').objectStore('cases').get(caseId));
+  const existing = await getCaseDetails(database, caseId);
+  const requestedCreatedAt = typeof caseDetails.createdAt === 'string' && !Number.isNaN(Date.parse(caseDetails.createdAt))
+    ? caseDetails.createdAt
+    : existing.createdAt;
+  const details = {
+    caseId,
+    title: title.trim(),
+    leadInvestigator: leadInvestigator.trim(),
+    description: description.trim(),
+    status,
+    createdAt: stored?.details ? existing.createdAt : requestedCreatedAt,
+    updatedAt: new Date().toISOString(),
+  };
+  const key = await getEncryptionKey(database);
+  await putRecord(database, 'cases', {
+    caseId,
+    details: await encryptBytes(key, encoder.encode(JSON.stringify(details))),
+  });
+  return details;
 }
 
 export async function addCustodyEvent(database, id, actor, action) {
@@ -161,6 +404,7 @@ export async function addCustodyEvent(database, id, actor, action) {
   if (!record) throw new Error('Evidence record was not found.');
   const key = await getEncryptionKey(database);
   const metadata = JSON.parse(decoder.decode(await decryptBytes(key, record.metadata)));
+  assertEvidenceIsActive(metadata);
   metadata.custody.push(await createCustodyEvent(metadata.custody, actor, action));
   record.metadata = await encryptBytes(key, encoder.encode(JSON.stringify(metadata)));
   await putRecord(database, 'records', record);
@@ -182,6 +426,7 @@ export async function saveExifValidation(database, id, validation) {
   if (!record) throw new Error('Evidence record was not found.');
   const key = await getEncryptionKey(database);
   const metadata = JSON.parse(decoder.decode(await decryptBytes(key, record.metadata)));
+  assertEvidenceIsActive(metadata);
   const savedValidation = {
     status,
     analyst: analyst.trim(),
@@ -214,6 +459,7 @@ export async function saveRegistryAnalysis(database, id, analysis) {
   if (!record) throw new Error('Evidence record was not found.');
   const key = await getEncryptionKey(database);
   const metadata = JSON.parse(decoder.decode(await decryptBytes(key, record.metadata)));
+  assertEvidenceIsActive(metadata);
   const savedAnalysis = {
     report,
     status,
@@ -253,6 +499,7 @@ export async function savePcapAnalysis(database, id, analysis) {
   if (!record) throw new Error('Evidence record was not found.');
   const key = await getEncryptionKey(database);
   const metadata = JSON.parse(decoder.decode(await decryptBytes(key, record.metadata)));
+  assertEvidenceIsActive(metadata);
   const savedAnalysis = {
     report,
     status,
@@ -291,6 +538,7 @@ export async function saveSqliteAnalysis(database, id, analysis) {
   if (!record) throw new Error('Evidence record was not found.');
   const key = await getEncryptionKey(database);
   const metadata = JSON.parse(decoder.decode(await decryptBytes(key, record.metadata)));
+  assertEvidenceIsActive(metadata);
   const savedAnalysis = {
     report,
     status,
@@ -325,9 +573,11 @@ export async function saveCopilotFinding(database, id, finding) {
   if (!record) throw new Error('Evidence record was not found.');
   const key = await getEncryptionKey(database);
   const metadata = JSON.parse(decoder.decode(await decryptBytes(key, record.metadata)));
+  assertEvidenceIsActive(metadata);
   const caseRecords = await getCaseRecords(database, record.caseId);
   const sourceRecords = new Map(caseRecords.map((item) => [item.id, item]));
   if (!finding.observedEvidence.every((fact) => fact.caseId === record.caseId
+    && !sourceRecords.get(fact.evidenceId)?.archivedAt
     && sourceRecords.get(fact.evidenceId)?.sha256 === fact.sha256)) {
     throw new Error('Copilot finding evidence must belong to this case and match its current SHA-256.');
   }
@@ -370,6 +620,7 @@ export async function validateCopilotFinding(database, id, findingId, validation
   if (!record) throw new Error('Evidence record was not found.');
   const key = await getEncryptionKey(database);
   const metadata = JSON.parse(decoder.decode(await decryptBytes(key, record.metadata)));
+  assertEvidenceIsActive(metadata);
   const findings = metadata.copilotFindings || [];
   const finding = findings.find((saved) => saved.id === findingId);
   if (!finding) throw new Error('Copilot finding was not found.');

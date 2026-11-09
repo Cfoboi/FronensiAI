@@ -1,14 +1,19 @@
 import { expect, test } from 'vitest';
 import {
   addCustodyEvent,
+  archiveEvidenceRecord,
   downloadEvidence,
+  getCaseDetails,
   getCaseRecords,
+  getCases,
+  saveCaseDetails,
   saveCopilotFinding,
   saveExifValidation,
   savePcapAnalysis,
   saveRegistryAnalysis,
   saveSqliteAnalysis,
   saveEvidence,
+  replaceEvidence,
   validateCopilotFinding,
   verifyCustody,
   verifyEvidenceIntegrity,
@@ -19,30 +24,51 @@ const expectedSha256 = 'e15a12a20e3c0e0a5b68e8556b1bbb17800ec963a68c384fe20bdb75
 const encoder = new TextEncoder();
 
 function createMemoryVault() {
-  const stores = { records: new Map(), keys: new Map() };
+  const stores = { records: new Map(), keys: new Map(), cases: new Map() };
   const database = {
     stores,
     transaction(storeName) {
-      const transaction = {};
+      const transaction = {
+        pendingWrites: 0,
+        abort() {
+          queueMicrotask(() => transaction.onabort?.({ target: transaction }));
+        },
+      };
       transaction.objectStore = (name) => {
         const store = stores[name];
         return {
           put(value) {
+            transaction.pendingWrites += 1;
             return createRequest(() => {
-              store.set(value.id, value);
-              return value.id;
-            }, transaction);
+              const key = value.id || value.caseId;
+              store.set(key, value);
+              return key;
+            }, transaction, true);
+          },
+          add(value) {
+            transaction.pendingWrites += 1;
+            return createRequest(() => {
+              const key = value.id || value.caseId;
+              if (store.has(key)) throw new Error('Evidence ID already exists.');
+              store.set(key, value);
+              return key;
+            }, transaction, true);
           },
           get(key) {
-            return createRequest(() => store.get(key));
+            return createRequest(() => {
+              const value = store.get(key);
+              return value === undefined ? undefined : structuredClone(value);
+            });
           },
           getAll() {
-            return createRequest(() => [...store.values()]);
+            return createRequest(() => [...store.values()].map((value) => structuredClone(value)));
           },
           index() {
             return {
               getAll(value) {
-                return createRequest(() => [...store.values()].filter((item) => item.caseId === value));
+                return createRequest(() => [...store.values()]
+                  .filter((item) => item.caseId === value)
+                  .map((item) => structuredClone(item)));
               },
             };
           },
@@ -54,13 +80,16 @@ function createMemoryVault() {
   return database;
 }
 
-function createRequest(operation, transaction) {
+function createRequest(operation, transaction, isWrite = false) {
   const request = {};
   queueMicrotask(() => {
     try {
       request.result = operation();
       request.onsuccess?.({ target: request });
-      if (transaction) queueMicrotask(() => transaction.oncomplete?.({ target: transaction }));
+      if (transaction && isWrite) {
+        transaction.pendingWrites -= 1;
+        if (!transaction.pendingWrites) queueMicrotask(() => transaction.oncomplete?.({ target: transaction }));
+      }
     } catch (error) {
       request.error = error;
       request.onerror?.({ target: request });
@@ -93,6 +122,17 @@ async function saveSample(database) {
     caseId: 'TEST-ONLY',
     custodian: 'Automated Test',
   });
+}
+
+function makeReplacementFile(name, text) {
+  const bytes = encoder.encode(text);
+  return {
+    name,
+    type: 'text/plain',
+    size: bytes.byteLength,
+    lastModified: 1_700_000_100_000,
+    arrayBuffer: async () => bytes.slice().buffer,
+  };
 }
 
 function makeSampleExifJpeg() {
@@ -129,6 +169,216 @@ test('hashes sample evidence with SHA-256 and decrypts it for download', async (
   const encryptedFile = database.stores.records.get(id).file;
   expect(new Uint8Array(encryptedFile.ciphertext)).not.toEqual(encoder.encode(sampleText));
   await expect(readBlobText(await downloadEvidence(database, id))).resolves.toBe(sampleText);
+});
+
+test('archives evidence without removing original bytes, hash, reports, or custody history', async () => {
+  const database = createMemoryVault();
+  const id = await saveSample(database);
+  const report = {
+    format: 'Windows Registry Hive (REGF)',
+    hiveType: 'SOFTWARE',
+    parsedAt: '2026-10-30T00:00:00.000Z',
+    keyCount: 1,
+    artifacts: [{ type: 'Startup command', keyPath: 'Software\\Run', values: [] }],
+    warnings: [],
+  };
+  await saveRegistryAnalysis(database, id, {
+    report,
+    status: 'VERIFIED',
+    analyst: 'Registry Analyst',
+    notes: 'Existing report to retain.',
+    artifactReferences: ['REF-100'],
+  });
+  const [before] = await getCaseRecords(database, 'TEST-ONLY');
+  const originalCiphertext = database.stores.records.get(id).file.ciphertext.slice(0);
+
+  const archived = await archiveEvidenceRecord(database, id, {
+    analyst: '  Case Investigator  ',
+    reason: '  Superseded intake record; retained for historical review.  ',
+    userId: 'investigator-1',
+  });
+  const [after] = await getCaseRecords(database, 'TEST-ONLY');
+
+  expect(archived.id).toBe(id);
+  expect(Date.parse(archived.archivedAt)).not.toBeNaN();
+  expect(after).toMatchObject({
+    id,
+    sha256: before.sha256,
+    archivedAt: archived.archivedAt,
+    archive: {
+      action: 'removed',
+      analyst: 'Case Investigator',
+      userId: 'investigator-1',
+      reason: 'Superseded intake record; retained for historical review.',
+      originalEvidenceId: id,
+      replacementEvidenceId: null,
+    },
+    registryAnalysis: before.registryAnalysis,
+  });
+  expect(database.stores.records.get(id).file.ciphertext).toEqual(originalCiphertext);
+  expect(after.custody.slice(0, before.custody.length)).toEqual(before.custody);
+  expect(after.custody.at(-1)).toMatchObject({
+    actor: 'Case Investigator',
+    action: 'Evidence removed from case',
+    details: {
+      action: 'remove_from_case',
+      analyst: 'Case Investigator',
+      userId: 'investigator-1',
+      reason: 'Superseded intake record; retained for historical review.',
+      originalEvidenceId: id,
+      replacementEvidenceId: null,
+    },
+  });
+  expect(await verifyCustody(after.custody)).toBe(true);
+  await expect(readBlobText(await downloadEvidence(database, id))).resolves.toBe(sampleText);
+  await expect(archiveEvidenceRecord(database, id, { analyst: 'Analyst', reason: 'Repeat' }))
+    .rejects.toThrow(/already archived/i);
+});
+
+test('replacement creates a linked new record and preserves all original forensic history', async () => {
+  const database = createMemoryVault();
+  const originalId = await saveSample(database);
+  const report = {
+    format: 'Windows Registry Hive (REGF)',
+    hiveType: 'SOFTWARE',
+    parsedAt: '2026-10-30T00:00:00.000Z',
+    keyCount: 1,
+    artifacts: [{ type: 'Startup command', keyPath: 'Software\\Run', values: [] }],
+    warnings: [],
+  };
+  await saveRegistryAnalysis(database, originalId, {
+    report,
+    status: 'NEEDS REVIEW',
+    analyst: 'Registry Analyst',
+    notes: 'Preserve this historical report.',
+    artifactReferences: ['REG-REF-2'],
+  });
+  const [before] = await getCaseRecords(database, 'TEST-ONLY');
+  const originalCiphertext = database.stores.records.get(originalId).file.ciphertext.slice(0);
+  const file = makeReplacementFile('replacement-sample.txt', 'Harmless replacement sample.\n');
+
+  const replacementId = await replaceEvidence(database, originalId, {
+    file,
+    analyst: 'Replacement Investigator',
+    reason: 'Corrected acquisition from source device.',
+    userId: 'investigator-1',
+  });
+  const records = await getCaseRecords(database, 'TEST-ONLY');
+  const original = records.find((record) => record.id === originalId);
+  const replacement = records.find((record) => record.id === replacementId);
+
+  expect(replacementId).not.toBe(originalId);
+  expect(records).toHaveLength(2);
+  expect(original.sha256).toBe(before.sha256);
+  expect(original.registryAnalysis).toEqual(before.registryAnalysis);
+  expect(original.replacementEvidenceId).toBe(replacementId);
+  expect(original.archive).toMatchObject({
+    action: 'replaced',
+    analyst: 'Replacement Investigator',
+    userId: 'investigator-1',
+    reason: 'Corrected acquisition from source device.',
+    originalEvidenceId: originalId,
+    replacementEvidenceId: replacementId,
+  });
+  expect(original.custody.at(-1)).toMatchObject({
+    action: 'Evidence replaced',
+    details: {
+      action: 'replace_evidence',
+      analyst: 'Replacement Investigator',
+      userId: 'investigator-1',
+      reason: 'Corrected acquisition from source device.',
+      originalEvidenceId: originalId,
+      replacementEvidenceId: replacementId,
+    },
+  });
+  expect(replacement).toMatchObject({
+    id: replacementId,
+    caseId: 'TEST-ONLY',
+    name: 'replacement-sample.txt',
+    replacement: {
+      originalEvidenceId: originalId,
+      analyst: 'Replacement Investigator',
+      userId: 'investigator-1',
+      reason: 'Corrected acquisition from source device.',
+    },
+    custody: [{
+      action: 'Evidence received as replacement',
+      details: {
+        originalEvidenceId: originalId,
+        replacementEvidenceId: replacementId,
+      },
+    }],
+  });
+  expect(replacement.sha256).not.toBe(before.sha256);
+  expect(replacement.custody[0].timestamp).toBe(original.custody.at(-1).timestamp);
+  expect(database.stores.records.get(originalId).file.ciphertext).toEqual(originalCiphertext);
+  expect(original.custody.slice(0, before.custody.length)).toEqual(before.custody);
+  expect(await verifyCustody(original.custody)).toBe(true);
+  expect(await verifyCustody(replacement.custody)).toBe(true);
+  await expect(readBlobText(await downloadEvidence(database, originalId))).resolves.toBe(sampleText);
+  await expect(readBlobText(await downloadEvidence(database, replacementId))).resolves.toBe('Harmless replacement sample.\n');
+  await expect(verifyEvidenceIntegrity(database, replacementId, replacement.sha256))
+    .resolves.toMatchObject({ status: 'MATCH' });
+});
+
+test('stores encrypted case details, preserves the case ID and creation date, and reopens saved values', async () => {
+  const database = createMemoryVault();
+  const caseId = 'PRESERVE-CASE-001';
+  const initial = await getCaseDetails(database, caseId);
+  const saved = await saveCaseDetails(database, {
+    ...initial,
+    caseId,
+    title: 'Incident response review',
+    leadInvestigator: 'Investigator One',
+    description: 'Review access activity and associated artifacts.',
+    status: 'In Progress',
+  });
+
+  expect(saved).toMatchObject({
+    caseId,
+    title: 'Incident response review',
+    leadInvestigator: 'Investigator One',
+    description: 'Review access activity and associated artifacts.',
+    status: 'In Progress',
+    createdAt: initial.createdAt,
+  });
+  expect(Date.parse(saved.updatedAt)).toBeGreaterThanOrEqual(Date.parse(saved.createdAt));
+  expect(database.stores.cases.get(caseId)).not.toHaveProperty('title');
+  expect(JSON.stringify(database.stores.cases.get(caseId))).not.toContain('Incident response review');
+  await expect(getCaseDetails(database, caseId)).resolves.toEqual(saved);
+  await expect(getCases(database)).resolves.toContain(caseId);
+
+  const updated = await saveCaseDetails(database, { ...saved, status: 'Under Review' });
+  expect(updated.createdAt).toBe(saved.createdAt);
+  expect(Date.parse(updated.updatedAt)).toBeGreaterThanOrEqual(Date.parse(saved.updatedAt));
+  await expect(getCaseDetails(database, caseId)).resolves.toEqual(updated);
+});
+
+test('case details reject invalid status without changing stored case details', async () => {
+  const database = createMemoryVault();
+  const caseId = 'PRESERVE-CASE-002';
+  const initial = await getCaseDetails(database, caseId);
+  const saved = await saveCaseDetails(database, { ...initial, caseId, title: 'Unchanged' });
+  await expect(saveCaseDetails(database, { ...saved, status: 'Archived' })).rejects.toThrow('Choose a valid case status.');
+  await expect(getCaseDetails(database, caseId)).resolves.toEqual(saved);
+});
+
+test('adding case details to a legacy case leaves its evidence record and original case ID untouched', async () => {
+  const database = createMemoryVault();
+  const evidenceId = await saveSample(database);
+  const before = structuredClone(database.stores.records.get(evidenceId));
+  const details = await getCaseDetails(database, 'TEST-ONLY');
+
+  expect(details.createdAt).toBe(before.createdAt);
+  await saveCaseDetails(database, {
+    ...details,
+    title: 'Legacy case details',
+    leadInvestigator: 'Investigator Two',
+    description: 'Metadata added without changing evidence.',
+  });
+
+  expect(database.stores.records.get(evidenceId)).toEqual(before);
+  await expect(getCases(database)).resolves.toContain('TEST-ONLY');
 });
 
 test('independently verifies decrypted evidence without changing stored bytes or custody', async () => {

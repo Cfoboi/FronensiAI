@@ -1,4 +1,14 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import {
+  authorizeCase as authorizeCaseWithLookups,
+  CaseAuthorizationQueryError,
+  type CopilotCaseRole,
+} from './authorization.ts';
+import {
+  classifyProviderHttpFailure,
+  ProviderRequestError,
+  providerFailureForLog,
+} from './provider-diagnostics.ts';
 
 const unavailableMessage = 'AI Copilot unavailable — secure AI provider configuration required.';
 const allowedFactKeys = new Set([
@@ -16,6 +26,10 @@ const allowedFactKeys = new Set([
   'value',
 ]);
 const maximumRequestBytes = 24_000;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
 
 async function readLimitedBody(request: Request) {
   const reader = request.body?.getReader();
@@ -130,32 +144,36 @@ async function authenticate(request: Request, supabaseUrl: string, anonKey: stri
     global: { headers: { Authorization: `Bearer ${match[1]}` } },
   });
   const { data, error } = await client.auth.getUser(match[1]);
-  return error ? null : data.user;
+  return error || !data.user ? null : { user: data.user, client };
 }
 
 async function authorizeCase(
   userId: string,
   caseNumber: string,
-  requiredRole: 'read' | 'investigator',
-  adminClient: ReturnType<typeof createClient>,
+  requiredRole: CopilotCaseRole,
+  userClient: ReturnType<typeof createClient>,
 ) {
-  const { data: caseRow, error: caseError } = await adminClient
-    .from('cases')
-    .select('id')
-    .eq('case_number', caseNumber)
-    .is('archived_at', null)
-    .maybeSingle();
-  if (caseError || !caseRow) return null;
-  const { data: membership, error: membershipError } = await adminClient
-    .from('case_memberships')
-    .select('role')
-    .eq('case_id', caseRow.id)
-    .eq('user_id', userId)
-    .eq('is_active', true)
-    .maybeSingle();
-  if (membershipError || !membership) return null;
-  if (requiredRole === 'investigator' && !['admin', 'investigator'].includes(membership.role)) return null;
-  return { caseId: caseRow.id, role: membership.role };
+  return authorizeCaseWithLookups(userId, caseNumber, requiredRole, {
+    findActiveCase: async (number) => {
+      const { data, error } = await userClient
+        .from('cases')
+        .select('id')
+        .eq('case_number', number)
+        .is('archived_at', null)
+        .maybeSingle();
+      return { data, error };
+    },
+    findActiveMembership: async (caseId, memberUserId) => {
+      const { data, error } = await userClient
+        .from('case_memberships')
+        .select('role')
+        .eq('case_id', caseId)
+        .eq('user_id', memberUserId)
+        .eq('is_active', true)
+        .maybeSingle();
+      return { data, error };
+    },
+  });
 }
 
 async function askProvider(question: string, facts: unknown[], apiKey: string, model: string) {
@@ -187,18 +205,39 @@ async function askProvider(question: string, facts: unknown[], apiKey: string, m
         ],
       }),
     });
-    if (!response.ok) throw new Error('AI provider returned an error.');
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw classifyProviderHttpFailure(response.status, errorBody.slice(0, 8_192));
+    }
     const resultText = await response.text();
-    if (new TextEncoder().encode(resultText).byteLength > 32_000) throw new Error('AI provider response exceeded the size limit.');
-    const result = JSON.parse(resultText);
-    const content = result.choices?.[0]?.message?.content;
-    if (typeof content !== 'string' || content.length > 16_000) throw new Error('AI provider returned an invalid response.');
-    const parsed = JSON.parse(content);
-    if (!Array.isArray(parsed.interpretations)
+    if (new TextEncoder().encode(resultText).byteLength > 32_000) {
+      throw new ProviderRequestError('provider_response_parse', 'malformed_response');
+    }
+    let result: unknown;
+    try {
+      result = JSON.parse(resultText);
+    } catch {
+      throw new ProviderRequestError('provider_response_parse', 'malformed_response');
+    }
+    const choices = isRecord(result) && Array.isArray(result.choices) ? result.choices : [];
+    const firstChoice = choices[0];
+    const message = isRecord(firstChoice) ? firstChoice.message : null;
+    const content = isRecord(message) ? message.content : null;
+    if (typeof content !== 'string' || content.length > 16_000) {
+      throw new ProviderRequestError('provider_response_validation', 'malformed_response');
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      throw new ProviderRequestError('provider_response_validation', 'malformed_response');
+    }
+    if (!isRecord(parsed)
+      || !Array.isArray(parsed.interpretations)
       || !Array.isArray(parsed.investigativeLeads)
       || !Array.isArray(parsed.recommendations)
       || typeof parsed.insufficientEvidence !== 'boolean') {
-      throw new Error('AI provider returned an invalid response shape.');
+      throw new ProviderRequestError('provider_response_validation', 'malformed_response');
     }
     return parsed;
   } finally {
@@ -224,13 +263,13 @@ Deno.serve(async (request: Request) => {
 
   const supabaseUrl = Deno.env.get('SUPABASE_URL');
   const anonKey = Deno.env.get('SUPABASE_ANON_KEY');
-  const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
-  if (!supabaseUrl || !anonKey || !serviceRoleKey) {
+  if (!supabaseUrl || !anonKey) {
     return jsonResponse({ error: unavailableMessage }, 503, origin, allowedOrigins);
   }
 
-  const user = await authenticate(request, supabaseUrl, anonKey);
-  if (!user) return jsonResponse({ error: 'Authentication required.' }, 401, origin, allowedOrigins);
+  const authenticated = await authenticate(request, supabaseUrl, anonKey);
+  if (!authenticated) return jsonResponse({ error: 'Authentication required.' }, 401, origin, allowedOrigins);
+  const { user, client: userClient } = authenticated;
 
   let body: Record<string, unknown>;
   try {
@@ -258,12 +297,24 @@ Deno.serve(async (request: Request) => {
   }
   if (!text(body.caseNumber, 120)) return jsonResponse({ error: 'A valid case number is required.' }, 400, origin, allowedOrigins);
 
-  const adminClient = createClient(supabaseUrl, serviceRoleKey, {
-    auth: { autoRefreshToken: false, persistSession: false },
-  });
-  const requiredRole = action === 'authorize_validation' ? 'investigator' : 'read';
-  const authorization = await authorizeCase(user.id, body.caseNumber, requiredRole, adminClient);
-  if (!authorization) return jsonResponse({ error: 'Access denied for this case.' }, 403, origin, allowedOrigins);
+  const requiredRole: CopilotCaseRole = action === 'authorize_validation' ? 'investigator' : 'read';
+  let authorization;
+  try {
+    authorization = await authorizeCase(user.id, body.caseNumber, requiredRole, userClient);
+  } catch (error) {
+    if (error instanceof CaseAuthorizationQueryError) {
+      console.error('Copilot case authorization query failed.', { stage: error.stage, code: error.code });
+    } else {
+      console.error('Copilot case authorization failed unexpectedly.');
+    }
+    return jsonResponse({ error: 'Case authorization could not be verified.' }, 500, origin, allowedOrigins);
+  }
+  if (!authorization.authorized) {
+    const message = authorization.reason === 'insufficient_role'
+      ? 'Insufficient case role for this action.'
+      : 'Case not found or unavailable to this account.';
+    return jsonResponse({ error: message }, 403, origin, allowedOrigins);
+  }
 
   if (action === 'authorize_validation') {
     return jsonResponse({ authorized: true, investigatorId: user.id, investigator: user.email || user.id }, 200, origin, allowedOrigins);
@@ -283,7 +334,14 @@ Deno.serve(async (request: Request) => {
     const result = await askProvider(body.question, facts, apiKey, Deno.env.get('OPENAI_MODEL') || 'gpt-4o-mini');
     return jsonResponse(groundResponse(result, facts as Record<string, unknown>[]), 200, origin, allowedOrigins);
   } catch (error) {
-    const timedOut = error instanceof Error && error.name === 'AbortError';
+    const diagnostic = providerFailureForLog(error);
+    console.error('Copilot provider request failed.', {
+      stage: diagnostic.stage,
+      status: diagnostic.status,
+      category: diagnostic.category,
+      code: diagnostic.code,
+    });
+    const timedOut = diagnostic.category === 'timeout';
     return jsonResponse({ error: timedOut ? 'AI provider request timed out.' : 'AI provider request failed.' }, 502, origin, allowedOrigins);
   }
 });

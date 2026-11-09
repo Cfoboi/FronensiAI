@@ -47,11 +47,79 @@ insert into storage.objects (bucket_id, name) values
 set local role authenticated;
 select set_config('request.jwt.claim.sub', '10000000-0000-4000-8000-000000000001', true);
 select is((select count(*)::integer from public.cases), 1, 'Admin sees only member cases');
+select is((select count(*)::integer from public.case_memberships where user_id = auth.uid()), 1, 'Case member can read their own active membership through RLS');
+select is((select count(*)::integer from public.case_memberships where case_id = '20000000-0000-4000-8000-000000000002'), 0, 'Case member cannot read memberships for a case they do not belong to');
 select is((select count(*)::integer from public.evidence_records), 1, 'Admin sees case evidence');
 select is((select count(*)::integer from public.evidence_hashes), 1, 'Admin sees case hashes');
 select is((select count(*)::integer from public.custody_events), 1, 'Admin sees custody events');
 select ok(public.has_case_role('20000000-0000-4000-8000-000000000001', array['investigator']::public.case_role[]), 'Investigator membership is recognized');
 select is((select count(*)::integer from storage.objects where bucket_id = 'forensiai-evidence'), 1, 'Admin reads only member evidence objects');
+select set_config('test.registration_evidence_count', (select count(*)::text from public.evidence_records), true);
+select set_config('test.registration_hash_count', (select count(*)::text from public.evidence_hashes), true);
+select set_config('test.registration_custody_count', (select count(*)::text from public.custody_events), true);
+select set_config('test.registered_local_case_id', public.register_local_case('TEST-2026-001')::text, true);
+select is(
+  (select case_number from public.cases where id = current_setting('test.registered_local_case_id')::uuid),
+  'TEST-2026-001',
+  'Local case registration preserves the supplied case number'
+);
+select is(
+  (select role::text from public.case_memberships
+   where case_id = current_setting('test.registered_local_case_id')::uuid
+     and user_id = auth.uid()),
+  'admin',
+  'Authenticated registrant receives an Admin membership'
+);
+select ok(
+  (select is_active from public.case_memberships
+   where case_id = current_setting('test.registered_local_case_id')::uuid
+     and user_id = auth.uid()),
+  'New case membership is active'
+);
+select is(
+  public.register_local_case('TEST-2026-001')::text,
+  current_setting('test.registered_local_case_id'),
+  'Repeated registration returns the existing authorized case'
+);
+select is(
+  (select count(*)::integer from public.cases where case_number = 'TEST-2026-001'),
+  1,
+  'Repeated registration does not create duplicate cases'
+);
+select is(
+  (select count(*)::integer from public.case_memberships
+   where case_id = current_setting('test.registered_local_case_id')::uuid
+     and user_id = auth.uid()),
+  1,
+  'Repeated registration does not create duplicate memberships'
+);
+select throws_ok(
+  $$select public.register_local_case('RLS-TEST-002')$$,
+  '42501',
+  'A user cannot register an existing case without active membership'
+);
+select is(
+  (select count(*)::integer from public.case_memberships
+   where case_id = '20000000-0000-4000-8000-000000000002'
+     and user_id = auth.uid()),
+  0,
+  'Failed registration does not grant membership to another team case'
+);
+select is(
+  (select count(*)::text from public.evidence_records),
+  current_setting('test.registration_evidence_count'),
+  'Case registration does not add or remove evidence records'
+);
+select is(
+  (select count(*)::text from public.evidence_hashes),
+  current_setting('test.registration_hash_count'),
+  'Case registration does not add or remove evidence hashes'
+);
+select is(
+  (select count(*)::text from public.custody_events),
+  current_setting('test.registration_custody_count'),
+  'Case registration does not add or remove custody events'
+);
 select throws_ok(
   $$insert into public.evidence_hashes (case_id, evidence_id, algorithm, digest, recorded_by, recorded_at) values ('20000000-0000-4000-8000-000000000001', '30000000-0000-4000-8000-000000000001', 'SHA-256', repeat('e', 64), '10000000-0000-4000-8000-000000000004', now() - interval '1 year')$$,
   '42501', 'Clients cannot directly spoof evidence hash provenance'
@@ -231,6 +299,11 @@ select ok(not public.can_upload_storage_object('20000000-0000-4000-8000-00000000
 select throws_ok(
   $$insert into storage.objects (bucket_id, name) values ('forensiai-evidence', '20000000-0000-4000-8000-000000000001/40000000-0000-4000-8000-000000000001/ciphertext.bin')$$,
   '42501', 'Anonymous upload is denied without helper permission errors'
+);
+select throws_ok(
+  $$select public.register_local_case('ANONYMOUS-CASE')$$,
+  '42501',
+  'Anonymous users cannot execute local case registration'
 );
 
 reset role;

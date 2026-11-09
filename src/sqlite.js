@@ -94,6 +94,19 @@ function execSingleValue(database, sql) {
   return results[0]?.values[0]?.[0] ?? 0;
 }
 
+function getSqlModule() {
+  if (!sqlPromise) {
+    sqlPromise = initSqlJs({ locateFile: () => wasmUrl }).catch((error) => {
+      sqlPromise = undefined;
+      throw new Error(
+        'SQLite WebAssembly could not be loaded. Reload the page and try again. If the problem persists, contact support.',
+        { cause: error },
+      );
+    });
+  }
+  return sqlPromise;
+}
+
 export async function analyzeSqlite(input, filename = '') {
   const bytes = toBytes(input);
   if (bytes.length > MAX_DATABASE_BYTES) throw new Error('The SQLite database exceeds the 256 MiB local analysis limit.');
@@ -101,8 +114,7 @@ export async function analyzeSqlite(input, filename = '') {
     throw new Error('The evidence is not a supported SQLite 3 database.');
   }
 
-  sqlPromise ||= initSqlJs({ locateFile: () => wasmUrl });
-  const SQLModule = await sqlPromise;
+  const SQLModule = await getSqlModule();
   let database;
   try {
     database = new SQLModule.Database(bytes);

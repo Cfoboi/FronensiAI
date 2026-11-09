@@ -78,6 +78,23 @@ test('lists SQLite schemas, bounded records, views, and recognized timestamp fie
   expect(report.tables.find((table) => table.name === 'event_titles').type).toBe('view');
 });
 
+test('initializes SQLite WebAssembly and reads tables from a valid .db evidence file', async () => {
+  const bytes = await createFixture();
+  const report = await analyzeSqlite(bytes, 'synthetic-evidence.db');
+  const events = report.tables.find((table) => table.name === 'events');
+
+  expect(report).toMatchObject({
+    format: 'SQLite Database',
+    filename: 'synthetic-evidence.db',
+    tableCount: 1,
+  });
+  expect(events.records).toHaveLength(2);
+  expect(events.records[0]).toMatchObject({
+    id: 1,
+    title: 'harmless test row',
+  });
+});
+
 test('rejects invalid and over-limit inputs without changing the source buffer', async () => {
   await expect(analyzeSqlite(new Uint8Array(20))).rejects.toThrow(/not a supported SQLite 3 database/);
   await expect(analyzeSqlite('not a database')).rejects.toThrow(/ArrayBuffer or byte array/);

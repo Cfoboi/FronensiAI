@@ -2,29 +2,40 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   addCustodyEvent,
+  archiveEvidenceRecord,
   downloadEvidence,
+  getCaseDetails,
   getCaseRecords,
   getCases,
   openVault,
   saveCopilotFinding,
+  saveCaseDetails,
   saveExifValidation,
   savePcapAnalysis,
   saveRegistryAnalysis,
   saveSqliteAnalysis,
   saveEvidence,
+  replaceEvidence,
   validateCopilotFinding,
   verifyCustody,
 } from './vault';
 import EvidenceIntegrity from './EvidenceIntegrity';
 import { parsePcap } from './pcap';
 import { parseRegistryHive } from './registry';
+import RegistryAnalysisResults from './RegistryAnalysisResults';
+import SavedAnalysisReports from './SavedAnalysisReports';
+import ReportExportActions from './ReportExportActions';
 import { analyzeSqlite } from './sqlite';
 import {
   buildCopilotEvidenceContext,
   callCopilot,
+  combineCopilotResponses,
   COPILOT_UNAVAILABLE_MESSAGE,
+  getCopilotRequestSize,
   makeCopilotFinding,
   makeCopilotQuestion,
+  MAX_COPILOT_REQUEST_BYTES,
+  partitionCopilotFacts,
   validateCopilotResponse,
 } from './copilot';
 import {
@@ -33,7 +44,10 @@ import {
   filterTimelineEvents,
   timelineToCsv,
 } from './timeline';
+import { getCaseMembershipRole, registerLocalCase } from './supabase/cases';
 import { supabase, supabaseConfigured } from './supabase/client';
+import { readNavigationState, writeNavigationState } from './navigation-state';
+import ClueBoxLogo from './ClueBoxLogo';
 import './App.css';
 
 const formatBytes = (bytes) => {
@@ -80,9 +94,20 @@ function Icon({ name, size = 18 }) {
     shield: <><path d="M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11z" /><path d="m9 12 2 2 4-4" /></>,
     clock: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
     search: <><circle cx="10.8" cy="10.8" r="6.8" /><path d="m16 16 4 4" /></>,
+    eye: <><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z" /><circle cx="12" cy="12" r="3" /></>,
+    eyeOff: <><path d="m3 3 18 18M10.6 10.6a2 2 0 0 0 2.8 2.8" /><path d="M9.9 5.2A10.7 10.7 0 0 1 12 5c6.4 0 10 7 10 7a15.7 15.7 0 0 1-3.1 3.8M6.2 6.2C3.5 8 2 12 2 12s3.6 7 10 7c1.1 0 2.1-.2 3-.5" /></>,
     arrow: <><path d="M5 12h14m-6-6 6 6-6 6" /></>,
     check: <path d="m5 12 4 4L19 6" />,
     close: <><path d="m18 6-12 12M6 6l12 12" /></>,
+    folder: <><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /><path d="M3 10h18" /></>,
+    folderSearch: <><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v4" /><path d="M3 10h12" /><circle cx="16" cy="16" r="3" /><path d="m18.2 18.2 2 2" /></>,
+    camera: <><path d="M4 7h3l1.5-2h7L17 7h3a1 1 0 0 1 1 1v11H3V8a1 1 0 0 1 1-1z" /><circle cx="12" cy="13" r="3.5" /></>,
+    database: <><ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7" /></>,
+    network: <><circle cx="5" cy="12" r="2" /><circle cx="19" cy="6" r="2" /><circle cx="19" cy="18" r="2" /><path d="m7 11 10-4M7 13l10 4M19 8v8" /></>,
+    activity: <><path d="M3 12h4l3-8 4 16 3-8h4" /></>,
+    fileText: <><path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10z" /><path d="M13 3v7h7M8 14h8M8 18h6" /></>,
+    sparkles: <><path d="m12 3 1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z" /><path d="m19 14 .9 2.1L22 17l-2.1.9L19 20l-.9-2.1L16 17l2.1-.9z" /></>,
+    chevron: <path d="m9 18 6-6-6-6" />,
   };
 
   return (
@@ -93,17 +118,26 @@ function Icon({ name, size = 18 }) {
 }
 
 function App() {
+  const [initialNavigation] = useState(readNavigationState);
+  const [welcomeVisible, setWelcomeVisible] = useState(() => supabaseConfigured || !initialNavigation.entered);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [activeWorkspace, setActiveWorkspace] = useState('overview');
+  const [activeWorkspace, setActiveWorkspace] = useState(initialNavigation.workspace);
   const [copilotPanelOpen, setCopilotPanelOpen] = useState(false);
   const [copilotPanelMinimized, setCopilotPanelMinimized] = useState(false);
   const [copilotPanelExpanded, setCopilotPanelExpanded] = useState(false);
   const [db, setDb] = useState(null);
-  const [caseId, setCaseId] = useState('');
-  const [caseInput, setCaseInput] = useState('');
+  const [caseId, setCaseId] = useState(initialNavigation.caseId);
+  const [caseInput, setCaseInput] = useState(initialNavigation.caseId);
+  const [caseDetails, setCaseDetails] = useState(null);
+  const [caseDetailsBusy, setCaseDetailsBusy] = useState(false);
   const [cases, setCases] = useState([]);
   const [records, setRecords] = useState([]);
-  const [selectedId, setSelectedId] = useState(null);
+  const [selectedId, setSelectedId] = useState(initialNavigation.selectedId);
+  const [evidenceListView, setEvidenceListView] = useState('active');
+  const [evidenceAction, setEvidenceAction] = useState(null);
+  const [evidenceActionAnalyst, setEvidenceActionAnalyst] = useState('');
+  const [evidenceActionReason, setEvidenceActionReason] = useState('');
+  const [replacementFile, setReplacementFile] = useState(null);
   const [custodian, setCustodian] = useState('');
   const [custodyAction, setCustodyAction] = useState('Evidence reviewed');
   const [exifValidationStatus, setExifValidationStatus] = useState('NEEDS REVIEW');
@@ -130,15 +164,19 @@ function App() {
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [navigationWarning, setNavigationWarning] = useState('');
   const [custodyChainValid, setCustodyChainValid] = useState(true);
   const [authSession, setAuthSession] = useState(null);
+  const [authReady, setAuthReady] = useState(!supabase);
   const [authPanelOpen, setAuthPanelOpen] = useState(false);
   const [authMode, setAuthMode] = useState('signIn');
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
+  const [authPasswordVisible, setAuthPasswordVisible] = useState(false);
   const [authBusy, setAuthBusy] = useState(false);
   const [authMessage, setAuthMessage] = useState('');
   const [authError, setAuthError] = useState('');
+  const [teamCaseRegistration, setTeamCaseRegistration] = useState(null);
   const [copilotAvailability, setCopilotAvailability] = useState(COPILOT_UNAVAILABLE_MESSAGE);
   const [copilotConfigured, setCopilotConfigured] = useState(false);
   const [copilotSelectedIds, setCopilotSelectedIds] = useState([]);
@@ -170,15 +208,45 @@ function App() {
   const [reportError, setReportError] = useState('');
   const [reportNotice, setReportNotice] = useState('');
   const fileInput = useRef(null);
+  const caseInputRef = useRef(null);
   const workspaceRef = useRef(null);
+  const landingAuthRef = useRef(null);
   const appRootRef = useRef(null);
   const copilotLauncherRef = useRef(null);
   const copilotQuestionRef = useRef(null);
   const copilotConversationRef = useRef(null);
 
   const navigateToWorkspace = (workspace) => {
+    if (['exif', 'registry', 'pcap', 'sqlite'].includes(workspace)
+      && records.find((record) => record.id === selectedId)?.archivedAt) {
+      setSelectedId(activeRecords[0]?.id ?? null);
+    }
     setActiveWorkspace(workspace);
     if (workspaceRef.current) workspaceRef.current.scrollTop = 0;
+  };
+  const openLandingAuth = (mode) => {
+    setAuthMode(mode);
+    setAuthPasswordVisible(false);
+    setAuthError('');
+    setAuthMessage('');
+    setAuthPanelOpen(true);
+    requestAnimationFrame(() => {
+      if (typeof landingAuthRef.current?.scrollIntoView === 'function') {
+        landingAuthRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    });
+  };
+  const openModuleCard = (module) => {
+    if (module === 'copilot') {
+      setCopilotPanelMinimized(false);
+      setCopilotPanelOpen(true);
+      return;
+    }
+    if (module === 'cases') {
+      navigateToWorkspace('cases');
+      return;
+    }
+    navigateToWorkspace(module);
   };
   const closeCopilotPanel = () => {
     setCopilotPanelOpen(false);
@@ -204,20 +272,52 @@ function App() {
   useEffect(() => {
     if (!supabase) return undefined;
     let active = true;
-    supabase.auth.getSession().then(({ data, error: sessionError }) => {
-      if (!active) return;
-      if (sessionError) setAuthError(sessionError.message);
-      setAuthSession(data.session);
-    });
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    let authEventObserved = false;
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      authEventObserved = true;
       setAuthSession(session);
-      if (session) setAuthPanelOpen(false);
+      setAuthReady(true);
+      if (event === 'SIGNED_OUT') {
+        setWelcomeVisible(true);
+        setAuthPanelOpen(false);
+      } else if (event === 'SIGNED_IN') {
+        setWelcomeVisible(false);
+        setAuthPanelOpen(false);
+      } else if (event === 'INITIAL_SESSION' && session && initialNavigation.entered) {
+        setWelcomeVisible(false);
+      }
     });
+    supabase.auth.getSession()
+      .then(({ data, error: sessionError }) => {
+        if (!active || authEventObserved) return;
+        if (sessionError) setAuthError(sessionError.message);
+        setAuthSession(data.session);
+        if (data.session && initialNavigation.entered) setWelcomeVisible(false);
+        setAuthReady(true);
+      })
+      .catch((sessionError) => {
+        if (!active || authEventObserved) return;
+        setAuthError(sessionError.message || 'Could not restore the sign-in session.');
+        setAuthReady(true);
+      });
     return () => {
       active = false;
       subscription.unsubscribe();
     };
-  }, []);
+  }, [initialNavigation]);
+
+  useEffect(() => {
+    if (!authReady) return;
+    const saved = writeNavigationState({
+      entered: !welcomeVisible,
+      workspace: activeWorkspace,
+      caseId,
+      selectedId,
+    });
+    setNavigationWarning(saved
+      ? ''
+      : 'This browser could not save the active workspace for refresh recovery. Your evidence and case data remain unchanged.');
+  }, [authReady, welcomeVisible, activeWorkspace, caseId, selectedId]);
 
   useEffect(() => {
     if (caseId) setTimelineCaseId(caseId);
@@ -292,7 +392,15 @@ function App() {
       .then((items) => {
         if (active) {
           setRecords(items);
-          setSelectedId(items[0]?.id ?? null);
+          const preferredId = initialNavigation.caseId === caseId
+            ? initialNavigation.selectedId
+            : selectedId;
+          const preferredRecord = items.find((item) => item.id === preferredId);
+          if (preferredRecord?.archivedAt && activeWorkspace === 'evidence') setEvidenceListView('archived');
+          else setEvidenceListView('active');
+          setSelectedId(preferredRecord && (!preferredRecord.archivedAt || activeWorkspace === 'evidence')
+            ? preferredId
+            : items.find((item) => !item.archivedAt)?.id ?? null);
           setCopilotSelectedIds([]);
           setCopilotFacts([]);
           setCopilotApprovedFactIds([]);
@@ -303,6 +411,22 @@ function App() {
       })
       .catch((vaultError) => {
         if (active) setError(vaultError.message || 'Could not read this case from the vault.');
+      });
+    return () => { active = false; };
+  }, [db, caseId]);
+
+  useEffect(() => {
+    let active = true;
+    if (!db || !caseId) {
+      setCaseDetails(null);
+      return () => { active = false; };
+    }
+    getCaseDetails(db, caseId)
+      .then((details) => {
+        if (active) setCaseDetails(details);
+      })
+      .catch((vaultError) => {
+        if (active) setError(vaultError.message || 'Could not load this case details.');
       });
     return () => { active = false; };
   }, [db, caseId]);
@@ -341,6 +465,27 @@ function App() {
   }, [authSession]);
 
   const selectedRecord = records.find((record) => record.id === selectedId);
+  const activeCaseRegistration = teamCaseRegistration?.caseId === caseId
+    && teamCaseRegistration?.userId === authSession?.user?.id
+    ? teamCaseRegistration
+    : null;
+  const teamCaseRegistered = activeCaseRegistration?.status === 'registered';
+  const canManageCaseEvidence = !supabaseConfigured || (
+    teamCaseRegistered
+    && ['admin', 'investigator'].includes(activeCaseRegistration?.role)
+  );
+  const activeRecords = records.filter((record) => !record.archivedAt);
+  const archivedRecords = records.filter((record) => Boolean(record.archivedAt));
+  const activeEvidenceSelection = activeRecords.some((record) => record.id === selectedId)
+    ? selectedId
+    : '';
+  const copilotSelectedFacts = copilotFacts.filter((fact) => copilotApprovedFactIds.includes(fact.referenceId));
+  const copilotRequestBatches = useMemo(
+    () => copilotQuestion.trim() && copilotSelectedFacts.length
+      ? partitionCopilotFacts(copilotQuestion, copilotSelectedFacts, caseId)
+      : [],
+    [copilotQuestion, copilotFacts, copilotApprovedFactIds, caseId],
+  );
   const savedCopilotFindings = records.flatMap((record) => (
     (record.copilotFindings || []).map((finding) => ({ ...finding, evidenceRecord: record }))
   ));
@@ -356,17 +501,19 @@ function App() {
     () => [...new Set(timelineEvents.map((event) => event.sourceModule))].sort(),
     [timelineEvents],
   );
-  const filteredRecords = records.filter((record) => (
+  const visibleEvidenceRecords = evidenceListView === 'archived' ? archivedRecords : activeRecords;
+  const filteredRecords = visibleEvidenceRecords.filter((record) => (
     record.name.toLowerCase().includes(query.toLowerCase())
     || record.sha256.toLowerCase().includes(query.toLowerCase())
   ));
-  const savedAnalysisCount = records.reduce((count, record) => count
+  const savedAnalysisCount = activeRecords.reduce((count, record) => count
     + Number(Boolean(record.exifValidation))
     + Number(Boolean(record.registryAnalysis))
     + Number(Boolean(record.pcapAnalysis))
     + Number(Boolean(record.sqliteAnalysis)), 0);
   const workspaces = {
     overview: ['Command center', 'Case activity, evidence totals, and service status.'],
+    cases: ['Case Management', 'Review and update case details without changing its evidence.'],
     evidence: ['Evidence Locker', 'Browse, add, and inspect evidence with its integrity and custody history.'],
     exif: ['EXIF Analysis', 'Review image metadata and record manual analyst validation.'],
     registry: ['Windows Registry', 'Analyze offline registry hives and review extracted artifacts.'],
@@ -378,14 +525,26 @@ function App() {
   const analysisWorkspace = ['exif', 'registry', 'pcap', 'sqlite'].includes(activeWorkspace);
   const evidenceWorkspaceVisible = ['evidence', ...['exif', 'registry', 'pcap', 'sqlite']].includes(activeWorkspace);
   const workspaceNavigation = [
-    ['overview', 'Overview', 'OV'],
-    ['evidence', 'Evidence Locker', 'EV'],
-    ['exif', 'EXIF Analysis', 'EX'],
-    ['registry', 'Windows Registry', 'RG'],
-    ['pcap', 'PCAP Analysis', 'PC'],
-    ['sqlite', 'SQLite Analysis', 'DB'],
-    ['timeline', 'Timeline', 'TL'],
-    ['reports', 'Reports', 'RP'],
+    ['overview', 'Overview', 'folderSearch'],
+    ['cases', 'Case Management', 'folderSearch'],
+    ['evidence', 'Evidence Locker', 'folder'],
+    ['exif', 'EXIF Analysis', 'camera'],
+    ['registry', 'Windows Registry', 'database'],
+    ['pcap', 'PCAP Analysis', 'network'],
+    ['sqlite', 'SQLite Analysis', 'database'],
+    ['timeline', 'Timeline', 'activity'],
+    ['reports', 'Reports', 'fileText'],
+  ];
+  const moduleCards = [
+    { id: 'cases', title: 'Case Management', description: 'Edit case details, review status, and register for team access.', icon: 'folderSearch' },
+    { id: 'evidence', title: 'Evidence Locker', description: 'Securely browse evidence, integrity details, and custody history.', icon: 'folder' },
+    { id: 'exif', title: 'EXIF Analysis', description: 'Review image metadata and document analyst validation.', icon: 'camera' },
+    { id: 'registry', title: 'Registry Analysis', description: 'Inspect Windows registry hives and extracted artifacts.', icon: 'database' },
+    { id: 'pcap', title: 'PCAP Analysis', description: 'Analyze network packets, endpoints, and connections.', icon: 'network' },
+    { id: 'sqlite', title: 'SQLite Analysis', description: 'Review database schemas, records, and timestamp candidates.', icon: 'database' },
+    { id: 'timeline', title: 'Timeline', description: 'Correlate case events while preserving timestamp certainty.', icon: 'activity' },
+    { id: 'reports', title: 'Reports', description: 'Prepare and export a reviewable investigation report.', icon: 'fileText' },
+    { id: 'copilot', title: 'AI Copilot', description: 'Ask evidence-grounded questions with approved, cited facts.', icon: 'sparkles' },
   ];
 
   useEffect(() => {
@@ -425,15 +584,78 @@ function App() {
   const openCase = (event) => {
     event.preventDefault();
     const normalized = caseInput.trim();
-    if (!normalized) return;
+    if (!normalized || caseDetailsBusy) return;
     setError('');
     setNotice('');
+    if (normalized !== caseId) setCaseDetails(null);
     setCaseId(normalized);
     setCaseInput(normalized);
+    navigateToWorkspace('cases');
+  };
+
+  const saveActiveCaseDetails = async (event) => {
+    event.preventDefault();
+    if (!db || !caseDetails || !caseId) return;
+    setCaseDetailsBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      const savedDetails = await saveCaseDetails(db, { ...caseDetails, caseId });
+      setCaseDetails(savedDetails);
+      setCases(await getCases(db));
+      setNotice(`Details for ${caseId} saved.`);
+    } catch (saveError) {
+      setError(saveError.message || 'Case details could not be saved.');
+    } finally {
+      setCaseDetailsBusy(false);
+    }
+  };
+
+  const registerActiveCase = async () => {
+    const userId = authSession?.user?.id;
+    if (!caseId || !userId || !supabase) {
+      setTeamCaseRegistration({
+        caseId,
+        userId: userId || null,
+        status: 'error',
+        message: !caseId
+          ? 'Open a local case before registering it.'
+          : !userId
+            ? 'Sign in with Supabase before registering a case.'
+            : 'Supabase case registration is unavailable.',
+      });
+      return;
+    }
+
+    setTeamCaseRegistration({
+      caseId,
+      userId,
+      status: 'registering',
+      message: `Registering ${caseId} for team access…`,
+    });
+    try {
+      const registeredCaseId = await registerLocalCase(supabase, caseId);
+      const role = await getCaseMembershipRole(supabase, registeredCaseId, userId);
+      setTeamCaseRegistration({
+        caseId,
+        userId,
+        supabaseCaseId: registeredCaseId,
+        status: 'registered',
+        role,
+        message: `${caseId} is registered for team access. No evidence, keys, or analysis data were uploaded.`,
+      });
+    } catch (registrationError) {
+      setTeamCaseRegistration({
+        caseId,
+        userId,
+        status: 'error',
+        message: registrationError.message || 'The case could not be registered for team access.',
+      });
+    }
   };
 
   const prepareCopilotContext = async () => {
-    const selected = records.filter((record) => copilotSelectedIds.includes(record.id));
+    const selected = activeRecords.filter((record) => copilotSelectedIds.includes(record.id));
     setCopilotBusy(true);
     setCopilotError('');
     setCopilotResponse(null);
@@ -459,8 +681,121 @@ function App() {
     }
   };
 
+  const verifyCaseInvestigator = async () => {
+    if (!supabaseConfigured) return true;
+    const userId = authSession?.user?.id;
+    if (!userId || !activeCaseRegistration?.supabaseCaseId || !supabase) return false;
+    const role = await getCaseMembershipRole(supabase, activeCaseRegistration.supabaseCaseId, userId);
+    setTeamCaseRegistration((current) => current?.caseId === caseId && current?.userId === userId
+      ? { ...current, role }
+      : current);
+    return ['admin', 'investigator'].includes(role);
+  };
+
+  const openArchivedEvidence = async () => {
+    setError('');
+    if (!canManageCaseEvidence) {
+      setError('Archived evidence is available only to case Admins and Investigators.');
+      return;
+    }
+    try {
+      if (!await verifyCaseInvestigator()) {
+        setError('Your case membership does not authorize archived evidence review.');
+        return;
+      }
+      setEvidenceListView('archived');
+      if (!selectedRecord?.archivedAt) setSelectedId(archivedRecords[0]?.id ?? null);
+    } catch (authorizationError) {
+      setError(authorizationError.message || 'Case authorization could not be verified.');
+    }
+  };
+
+  const openEvidenceAction = (action) => {
+    if (!selectedRecord || selectedRecord.archivedAt) return;
+    if (!canManageCaseEvidence) {
+      setError('Sign in and register this case with an Admin or Investigator role before managing evidence.');
+      return;
+    }
+    setEvidenceAction(action);
+    setEvidenceActionAnalyst(authSession?.user?.email || custodian);
+    setEvidenceActionReason('');
+    setReplacementFile(null);
+    setError('');
+  };
+
+  const closeEvidenceAction = () => {
+    if (busy) return;
+    setEvidenceAction(null);
+    setEvidenceActionReason('');
+    setReplacementFile(null);
+  };
+
+  const confirmEvidenceAction = async (event) => {
+    event.preventDefault();
+    if (!db || !selectedRecord || selectedRecord.archivedAt || !evidenceAction) return;
+    if (!canManageCaseEvidence) {
+      setError('Case authorization is required to manage evidence.');
+      return;
+    }
+    if (!evidenceActionAnalyst.trim() || !evidenceActionReason.trim()) {
+      setError('Enter the analyst name and a reason before confirming this action.');
+      return;
+    }
+    if (evidenceAction === 'replace' && !replacementFile) {
+      setError('Choose a replacement evidence file before confirming.');
+      return;
+    }
+
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      if (!await verifyCaseInvestigator()) {
+        throw new Error('Your case membership does not authorize evidence management.');
+      }
+      const options = {
+        analyst: evidenceActionAnalyst,
+        reason: evidenceActionReason,
+        userId: authSession?.user?.id || null,
+      };
+      if (evidenceAction === 'replace') {
+        const replacementId = await replaceEvidence(db, selectedRecord.id, { ...options, file: replacementFile });
+        const updatedRecords = await getCaseRecords(db, caseId);
+        setRecords(updatedRecords);
+        setSelectedId(replacementId);
+        setEvidenceListView('active');
+        setCopilotSelectedIds((ids) => ids.filter((id) => id !== selectedRecord.id));
+        setCopilotFacts([]);
+        setCopilotApprovedFactIds([]);
+        setCopilotApproved(false);
+        setNotice(`Evidence replaced. New evidence ID: ${replacementId}. Original evidence remains archived with its hash and custody history.`);
+      } else {
+        await archiveEvidenceRecord(db, selectedRecord.id, options);
+        setRecords(await getCaseRecords(db, caseId));
+        setSelectedId(selectedRecord.id);
+        setEvidenceListView('archived');
+        setCopilotSelectedIds((ids) => ids.filter((id) => id !== selectedRecord.id));
+        setCopilotFacts([]);
+        setCopilotApprovedFactIds([]);
+        setCopilotApproved(false);
+        setNotice('Evidence removed from the active case view and archived. Original bytes, hash, and custody history were preserved.');
+      }
+      setEvidenceAction(null);
+      setEvidenceActionReason('');
+      setReplacementFile(null);
+    } catch (actionError) {
+      setError(actionError.message || 'The evidence action could not be completed.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const askCopilot = async (event) => {
     event.preventDefault();
+    if (!teamCaseRegistered) {
+      setCopilotError('Register the open local case for team access before sending a Copilot request.');
+      return;
+    }
     if (!copilotApproved) {
       setCopilotError('Review the structured facts and approve their transmission before asking the Copilot.');
       return;
@@ -469,21 +804,32 @@ function App() {
     setCopilotError('');
     setCopilotResponse(null);
     try {
-      const selectedFacts = copilotFacts.filter((fact) => copilotApprovedFactIds.includes(fact.referenceId));
-      const request = makeCopilotQuestion(copilotQuestion, selectedFacts);
-      const result = await callCopilot({
-        supabaseUrl: import.meta.env.VITE_SUPABASE_URL,
-        publishableKey: import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
-        accessToken: authSession?.access_token,
-        action: request.action,
-        payload: { caseNumber: caseId, question: request.question, facts: request.facts },
-      });
-      const response = validateCopilotResponse(result, selectedFacts);
-      setCopilotLatestQuestion(request.question);
+      const requestQuestion = copilotQuestion.trim();
+      const batches = partitionCopilotFacts(requestQuestion, copilotSelectedFacts, caseId);
+      const responses = [];
+      for (let index = 0; index < batches.length; index += 1) {
+        const batch = batches[index];
+        const request = makeCopilotQuestion(requestQuestion, batch, caseId);
+        let result;
+        try {
+          result = await callCopilot({
+            supabaseUrl: import.meta.env.VITE_SUPABASE_URL,
+            publishableKey: import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+            accessToken: authSession?.access_token,
+            action: request.action,
+            payload: { caseNumber: caseId, question: request.question, facts: request.facts },
+          });
+        } catch (batchError) {
+          throw new Error(`Copilot request batch ${index + 1} of ${batches.length} failed: ${batchError.message || 'AI service request failed.'}`, { cause: batchError });
+        }
+        responses.push(validateCopilotResponse(result, batch));
+      }
+      const response = combineCopilotResponses(responses);
+      setCopilotLatestQuestion(requestQuestion);
       setCopilotResponse(response);
       setCopilotConversation((messages) => [
         ...messages,
-        { id: messages.length + 1, question: request.question, response },
+        { id: messages.length + 1, question: requestQuestion, response },
       ]);
       setCopilotQuestion('');
     } catch (copilotRequestError) {
@@ -584,7 +930,7 @@ function App() {
     URL.revokeObjectURL(url);
   };
 
-  const downloadInvestigationReport = async () => {
+  const downloadInvestigationReport = async (format = 'json') => {
     if (!timelineCaseId) return;
     setReportBusy(true);
     setReportError('');
@@ -625,13 +971,22 @@ function App() {
         conclusions: reportConclusions,
       });
       const safeCaseId = timelineCaseId.replace(/[^\w.-]+/g, '-') || 'case';
-      const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' }));
+      const isPdf = format === 'pdf';
+      const blob = isPdf
+        ? await import('./InvestigationReportPdf').then(({ generateInvestigationPdf }) => (
+          generateInvestigationPdf(report, caseDetails?.leadInvestigator || '')
+        ))
+        : new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = `${safeCaseId}-investigation-report.json`;
+      link.download = `${safeCaseId}-investigation-report.${isPdf ? 'pdf' : 'json'}`;
       link.click();
       URL.revokeObjectURL(url);
-      setReportNotice('Investigation report exported. Integrity failures, unverified leads, ambiguous times, and limitations are identified in the report.');
+      setReportNotice(
+        `${isPdf ? 'PDF' : 'JSON'} investigation report exported locally. `
+        + 'Integrity failures, unverified leads, ambiguous times, and limitations are identified in the report.',
+      );
     } catch (reportBuildError) {
       setReportError(reportBuildError.message || 'The investigation report could not be generated.');
     } finally {
@@ -654,9 +1009,15 @@ function App() {
         setAuthMessage('Check your email to confirm the new account, then sign in.');
         setAuthMode('signIn');
         setAuthPassword('');
+        setAuthPasswordVisible(false);
       } else {
+        if (result.data.session) {
+          setAuthSession(result.data.session);
+          setWelcomeVisible(false);
+        }
         setAuthPanelOpen(false);
         setAuthPassword('');
+        setAuthPasswordVisible(false);
       }
     } catch (authIssue) {
       setAuthError(authIssue.message || 'Authentication failed.');
@@ -669,6 +1030,20 @@ function App() {
     if (!supabase) return;
     const { error: signOutError } = await supabase.auth.signOut();
     if (signOutError) setAuthError(signOutError.message);
+    else {
+      setAuthSession(null);
+      setWelcomeVisible(true);
+      setAuthPanelOpen(false);
+    }
+  };
+
+  const enterClueBoxOdyssey = () => {
+    setAuthPanelOpen(false);
+    if (!supabaseConfigured || authSession) {
+      setWelcomeVisible(false);
+      return;
+    }
+    openLandingAuth('signIn');
   };
 
   const handleFiles = async (fileList) => {
@@ -688,6 +1063,7 @@ function App() {
       const updatedRecords = await getCaseRecords(db, caseId);
       setRecords(updatedRecords);
       setSelectedId(updatedRecords[0]?.id ?? null);
+      setEvidenceListView('active');
       setCases(await getCases(db));
       setNotice(`${files.length} ${files.length === 1 ? 'file' : 'files'} encrypted and added to ${caseId}.`);
     } catch (vaultError) {
@@ -700,6 +1076,10 @@ function App() {
 
   const logCustodyEvent = async (event) => {
     event.preventDefault();
+    if (selectedRecord?.archivedAt) {
+      setError('Archived evidence is read-only and available for historical review.');
+      return;
+    }
     if (!selectedRecord || !custodian.trim()) {
       setError('Enter the custodian name to record a custody event.');
       return;
@@ -720,7 +1100,7 @@ function App() {
 
   const saveManualExifValidation = async (event) => {
     event.preventDefault();
-    if (!selectedRecord) return;
+    if (!selectedRecord || selectedRecord.archivedAt) return;
     setBusy(true);
     setError('');
     setNotice('');
@@ -741,7 +1121,7 @@ function App() {
   };
 
   const analyzeRegistryHive = async () => {
-    if (!selectedRecord) return;
+    if (!selectedRecord || selectedRecord.archivedAt) return;
     setBusy(true);
     setRegistryReport(null);
     setError('');
@@ -761,7 +1141,7 @@ function App() {
 
   const saveRegistryReport = async (event) => {
     event.preventDefault();
-    if (!selectedRecord || !registryReport) return;
+    if (!selectedRecord || selectedRecord.archivedAt || !registryReport) return;
     setBusy(true);
     setError('');
     setNotice('');
@@ -818,7 +1198,7 @@ function App() {
   };
 
   const analyzePcap = async () => {
-    if (!selectedRecord) return;
+    if (!selectedRecord || selectedRecord.archivedAt) return;
     setBusy(true);
     setPcapReport(null);
     setError('');
@@ -838,7 +1218,7 @@ function App() {
 
   const savePcapReport = async (event) => {
     event.preventDefault();
-    if (!selectedRecord || !pcapReport) return;
+    if (!selectedRecord || selectedRecord.archivedAt || !pcapReport) return;
     setBusy(true);
     setError('');
     setNotice('');
@@ -895,7 +1275,7 @@ function App() {
   };
 
   const analyzeSqliteDatabase = async () => {
-    if (!selectedRecord) return;
+    if (!selectedRecord || selectedRecord.archivedAt) return;
     setBusy(true);
     setSqliteReport(null);
     setError('');
@@ -915,7 +1295,7 @@ function App() {
 
   const saveSqliteReport = async (event) => {
     event.preventDefault();
-    if (!selectedRecord || !sqliteReport) return;
+    if (!selectedRecord || selectedRecord.archivedAt || !sqliteReport) return;
     setBusy(true);
     setError('');
     setNotice('');
@@ -986,12 +1366,158 @@ function App() {
     }
   };
 
+  const renderAuthPanel = (className, formRef) => (
+    <section ref={formRef} className={className} id="landing-auth" aria-label="Team account">
+      <form onSubmit={submitAuth}>
+        <div className="auth-panel-heading">
+          <div><p className="eyebrow">FORENSIAI TEAM ACCESS</p><h2>{authMode === 'signUp' ? 'Create investigator account' : 'Sign in to your account'}</h2></div>
+          <button type="button" className="auth-link" onClick={() => { setAuthMode(authMode === 'signUp' ? 'signIn' : 'signUp'); setAuthPasswordVisible(false); setAuthError(''); setAuthMessage(''); }}>
+            {authMode === 'signUp' ? 'Use existing account' : 'Create account'}
+          </button>
+        </div>
+        <div className="auth-fields">
+          <label>Email<input type="email" autoComplete="email" required value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} /></label>
+          <div className="auth-password-group">
+            <label htmlFor="auth-password">Password</label>
+            <div className="auth-password-field">
+              <input id="auth-password" type={authPasswordVisible ? 'text' : 'password'} autoComplete={authMode === 'signUp' ? 'new-password' : 'current-password'} minLength={8} required value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} />
+              <button
+                type="button"
+                className="auth-password-toggle"
+                aria-label={authPasswordVisible ? 'Hide password' : 'Show password'}
+                aria-pressed={authPasswordVisible}
+                onClick={() => setAuthPasswordVisible((visible) => !visible)}
+              >
+                <Icon name={authPasswordVisible ? 'eyeOff' : 'eye'} size={18} />
+              </button>
+            </div>
+          </div>
+          <button type="submit" className="button button-dark" disabled={authBusy}>{authBusy ? 'Please wait…' : authMode === 'signUp' ? 'Create account' : 'Sign in'}</button>
+        </div>
+        {authError && <p className="auth-feedback auth-feedback-error" role="alert">{authError}</p>}
+        {authMessage && <p className="auth-feedback" role="status">{authMessage}</p>}
+        <p className="auth-disclaimer">Your Supabase password is used only for sign-in. The separate vault passphrase is never sent to Supabase.</p>
+      </form>
+    </section>
+  );
+
+  if (!authReady) {
+    return (
+      <main className="auth-restore-screen" role="status" aria-live="polite">
+        <ClueBoxLogo size={84} />
+        <p>Restoring your ClueBox Odyssey session…</p>
+      </main>
+    );
+  }
+
+  if (welcomeVisible) {
+    return (
+      <div className="welcome-page">
+        <header className="welcome-nav">
+          <a className="welcome-brand" href="#welcome-top" aria-label="ClueBox Odyssey home">
+            <ClueBoxLogo size={46} />
+            <span>ClueBox <span>Odyssey</span></span>
+          </a>
+          <nav aria-label="Welcome navigation">
+            <a href="#features">Features</a>
+            <a href="#about">About</a>
+            <button type="button" onClick={() => openLandingAuth('signIn')}>Sign In</button>
+          </nav>
+        </header>
+
+        <main className="welcome-main" id="welcome-top">
+          <section className="welcome-hero" aria-labelledby="welcome-title">
+            <div className="welcome-hero-copy">
+              <p className="welcome-kicker"><span /> EXPLORE THE DIGITAL UNKNOWN</p>
+              <h1 id="welcome-title">Explore the<br /><span>Digital Unknown.</span></h1>
+              <p className="welcome-subtitle">ClueBox Odyssey brings secure evidence management, forensic analysis, and AI-assisted investigations into one focused workspace.</p>
+              <div className="welcome-actions">
+                <button type="button" className="welcome-button welcome-button-primary" onClick={() => openLandingAuth('signUp')}>
+                  Get Started <Icon name="chevron" size={18} />
+                </button>
+                <button type="button" className="welcome-button welcome-button-secondary" onClick={enterClueBoxOdyssey}>
+                  Enter ClueBox Odyssey <Icon name="arrow" size={16} />
+                </button>
+                <a className="welcome-button welcome-button-secondary" href="#features">Explore Features</a>
+              </div>
+              <div className="welcome-trust-row">
+                <span><Icon name="shield" size={16} /> Evidence integrity first</span>
+                <span><Icon name="lock" size={16} /> Private local vault</span>
+              </div>
+            </div>
+            <div className="welcome-hero-art">
+              <div className="welcome-art-glow" />
+              <div className="welcome-art-scene" role="img" aria-label="A glowing digital fingerprint inside a futuristic mystery box">
+                <span className="welcome-orbit welcome-orbit-one" />
+                <span className="welcome-orbit welcome-orbit-two" />
+                <ClueBoxLogo className="welcome-scene-logo" size={220} decorative />
+                <span className="welcome-scene-chip welcome-scene-chip-top">SIGNAL FOUND <i /></span>
+                <span className="welcome-scene-chip welcome-scene-chip-bottom">EVIDENCE · CONTEXT · CLUES</span>
+              </div>
+              <span className="welcome-art-caption"><span /> FORENSIC SIGNALS · EVIDENCE · CONTEXT</span>
+            </div>
+          </section>
+
+          {authPanelOpen && supabaseConfigured && renderAuthPanel('auth-panel landing-auth-panel', landingAuthRef)}
+          {authPanelOpen && !supabaseConfigured && (
+            <section ref={landingAuthRef} className="landing-auth-notice" id="landing-auth" role="alert">
+              <Icon name="shield" size={20} />
+              <div><strong>Team sign-in is not configured</strong><p>Connect this app to your Supabase project to sign in or create a team account. For local-only work, continue to the private vault below.</p></div>
+            </section>
+          )}
+          <section className="welcome-features" id="features" aria-labelledby="welcome-features-title">
+            <div className="welcome-section-heading">
+              <p className="welcome-kicker"><span /> BUILT FOR INVESTIGATIONS</p>
+              <h2 id="welcome-features-title">A clear view of every part of the case.</h2>
+              <p>Purpose-built tools for secure evidence handling and structured analysis.</p>
+            </div>
+            <div className="welcome-feature-grid">
+              {[
+                ['folder', 'Evidence Locker', 'Encrypted local evidence, integrity hashes, and custody history.'],
+                ['camera', 'Forensic Analysis', 'Dedicated EXIF, Registry, PCAP, and SQLite analysis tools.'],
+                ['folderSearch', 'Case Management', 'Organize investigations and explicitly register cases for team access.'],
+                ['activity', 'Timeline', 'Correlate forensic and custody events with timestamp context.'],
+                ['fileText', 'Reports', 'Build reviewable investigation reports with citations and limitations.'],
+                ['sparkles', 'AI Copilot', 'Explore approved structured facts with evidence-linked AI assistance.'],
+              ].map(([icon, title, description]) => (
+                <article className="welcome-feature-card" key={title}>
+                  <span className={`welcome-feature-icon welcome-feature-icon-${icon}`}><Icon name={icon} size={22} /></span>
+                  <h3>{title}</h3>
+                  <p>{description}</p>
+                  <span className="welcome-feature-line" />
+                </article>
+              ))}
+            </div>
+          </section>
+
+          <section className="welcome-about" id="about" aria-labelledby="welcome-about-title">
+            <div className="welcome-about-mark"><Icon name="shield" size={27} /></div>
+            <div>
+              <p className="welcome-kicker"><span /> DESIGNED FOR CAREFUL REVIEW</p>
+              <h2 id="welcome-about-title">Evidence stays at the center.</h2>
+              <p>ClueBox Odyssey brings secure local evidence handling, transparent analysis, and investigator review into one focused workspace. AI assistance is optional and grounded in facts that an investigator selects and approves.</p>
+            </div>
+          </section>
+        </main>
+
+        <footer className="welcome-footer">
+          <a className="welcome-brand" href="#welcome-top" aria-label="ClueBox Odyssey home">
+            <ClueBoxLogo size={40} />
+            <span>ClueBox <span>Odyssey</span></span>
+          </a>
+          <span>Explore the Digital Unknown.</span>
+          <a href="#about">About ClueBox Odyssey</a>
+        </footer>
+      </div>
+    );
+  }
+
   return (
     <div ref={appRootRef} className={`locker-app ${sidebarCollapsed ? 'locker-app-collapsed' : ''}`} data-active-workspace={activeWorkspace}>
       <aside className="command-sidebar" data-scroll-region="sidebar">
         <div className="sidebar-brand">
-          <span className="sidebar-brand-mark"><Icon name="shield" size={20} /></span>
-          <span className="sidebar-brand-copy">FORENSI<span>AI</span></span>
+          <ClueBoxLogo className="sidebar-brand-logo" size={42} />
+          <span className="sidebar-brand-copy">ClueBox <strong>Odyssey</strong><small>Explore the Digital Unknown.</small></span>
         </div>
         <button
           type="button"
@@ -1005,16 +1531,18 @@ function App() {
         </button>
         <p className="sidebar-group-label">INVESTIGATION</p>
         <nav className="sidebar-nav" aria-label="Forensic workspace navigation">
-          {workspaceNavigation.map(([workspace, label, abbreviation]) => (
+          {workspaceNavigation.map(([workspace, label, icon]) => (
             <button
               type="button"
               className={`sidebar-link ${activeWorkspace === workspace ? 'sidebar-link-active' : ''}`}
+              data-workspace={workspace}
               key={workspace}
+              aria-label={label}
               title={sidebarCollapsed ? label : undefined}
               aria-current={activeWorkspace === workspace ? 'page' : undefined}
               onClick={() => navigateToWorkspace(workspace)}
             >
-              <span className="sidebar-link-icon" aria-hidden="true">{abbreviation}</span>
+              <span className="sidebar-link-icon" data-icon={icon} aria-hidden="true"><Icon name={icon} size={18} /></span>
               <span className="sidebar-link-label">{label}</span>
             </button>
           ))}
@@ -1023,38 +1551,19 @@ function App() {
           <span className="sidebar-case-indicator" />
           <span className="sidebar-case-copy"><small>ACTIVE CASE</small><strong>{caseId || 'No case selected'}</strong></span>
         </div>
-        <button
-          ref={copilotLauncherRef}
-          type="button"
-          className="sidebar-copilot-launcher"
-          aria-label="Open AI Copilot chat"
-          aria-controls="copilot-chat-panel"
-          aria-expanded={copilotPanelOpen}
-          title="Open AI Forensic Copilot"
-          onClick={() => {
-            if (copilotPanelOpen) closeCopilotPanel();
-            else {
-              setCopilotPanelMinimized(false);
-              setCopilotPanelOpen(true);
-            }
-          }}
-        >
-          <span className="sidebar-link-icon" aria-hidden="true">AI</span>
-          <span className="sidebar-copilot-copy"><strong>AI Copilot</strong><small>{copilotConfigured ? 'Secure service ready' : 'Provider setup required'}</small></span>
-        </button>
       </aside>
       <div className="command-main">
         <header className="topbar">
-        <div className="brand" aria-label="Evidence Locker">
-          <span className="brand-mark"><Icon name="lock" size={20} /></span>
-          <span>Evidence<span className="brand-light">Locker</span></span>
+        <div className="brand" aria-label="ClueBox Odyssey">
+          <ClueBoxLogo size={34} />
+          <span>ClueBox <span className="brand-light">Odyssey</span></span>
         </div>
         <div className="topbar-right">
           <span className="privacy-indicator"><span className="privacy-dot" /> {supabaseConfigured ? 'TEAM SIGN-IN CONFIGURED' : 'PRIVATE LOCAL VAULT'}</span>
           {supabaseConfigured && (authSession ? (
             <div className="auth-user"><span title={authSession.user.email}>{authSession.user.email}</span><button type="button" className="auth-link" onClick={signOut}>Sign out</button></div>
           ) : (
-            <button type="button" className="auth-link auth-trigger" onClick={() => { setAuthError(''); setAuthMessage(''); setAuthPanelOpen((open) => !open); }}>
+            <button type="button" className="auth-link auth-trigger" onClick={() => { setAuthPasswordVisible(false); setAuthError(''); setAuthMessage(''); setAuthPanelOpen((open) => !open); }}>
               {authPanelOpen ? 'Close sign in' : 'Team sign in'}
             </button>
           ))}
@@ -1066,26 +1575,7 @@ function App() {
         </div>
         </header>
 
-      {supabaseConfigured && authPanelOpen && (
-        <section className="auth-panel" aria-label="Team account">
-          <form onSubmit={submitAuth}>
-            <div className="auth-panel-heading">
-              <div><p className="eyebrow">FORENSIAI TEAM ACCESS</p><h2>{authMode === 'signUp' ? 'Create investigator account' : 'Sign in to your account'}</h2></div>
-              <button type="button" className="auth-link" onClick={() => { setAuthMode(authMode === 'signUp' ? 'signIn' : 'signUp'); setAuthError(''); setAuthMessage(''); }}>
-                {authMode === 'signUp' ? 'Use existing account' : 'Create account'}
-              </button>
-            </div>
-            <div className="auth-fields">
-              <label>Email<input type="email" autoComplete="email" required value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} /></label>
-              <label>Password<input type="password" autoComplete={authMode === 'signUp' ? 'new-password' : 'current-password'} minLength={8} required value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} /></label>
-              <button type="submit" className="button button-dark" disabled={authBusy}>{authBusy ? 'Please wait…' : authMode === 'signUp' ? 'Create account' : 'Sign in'}</button>
-            </div>
-            {authError && <p className="auth-feedback auth-feedback-error" role="alert">{authError}</p>}
-            {authMessage && <p className="auth-feedback" role="status">{authMessage}</p>}
-            <p className="auth-disclaimer">Your Supabase password is used only for sign-in. The separate vault passphrase is never sent to Supabase.</p>
-          </form>
-        </section>
-      )}
+      {supabaseConfigured && authPanelOpen && renderAuthPanel('auth-panel', null)}
 
       <main className="workspace" data-scroll-region="main-workspace" ref={workspaceRef}>
         <section className="page-heading">
@@ -1101,52 +1591,165 @@ function App() {
           <form className="case-form" onSubmit={openCase}>
             <label htmlFor="case-id">CASE ID</label>
             <div className="case-input-wrap">
-              <input id="case-id" value={caseInput} onChange={(event) => setCaseInput(event.target.value)} placeholder="Enter a case ID" list="saved-cases" />
+              <input ref={caseInputRef} id="case-id" value={caseInput} onChange={(event) => setCaseInput(event.target.value)} placeholder="Enter a case ID" list="saved-cases" />
               <datalist id="saved-cases">{cases.map((savedCase) => <option key={savedCase} value={savedCase} />)}</datalist>
             </div>
-            <button type="submit" className="button button-dark" disabled={!db || !caseInput.trim()}>
+            <button type="submit" className="button button-dark" disabled={!db || !caseInput.trim() || caseDetailsBusy}>
               Open case <Icon name="arrow" size={16} />
             </button>
           </form>
           <div className="case-context">
             <span className="case-context-label">CURRENT CASE</span>
-            <strong>{caseId || 'No case selected'}</strong>
+            <strong>{caseDetails?.title || caseId || 'No case selected'}</strong>
+            {caseDetails?.title && <small>{caseId}</small>}
+            {caseDetails?.leadInvestigator && <small>Lead: {caseDetails.leadInvestigator}</small>}
+            {caseDetails && <span className={`case-status-badge case-status-${caseDetails.status.toLowerCase().replaceAll(' ', '-')}`}>{caseDetails.status}</span>}
           </div>
+          {caseId && (
+            <div className="team-case-registration">
+              <button
+                type="button"
+                className="button button-dark"
+                onClick={registerActiveCase}
+                disabled={!supabase || !authSession?.user?.id || activeCaseRegistration?.status === 'registering'}
+              >
+                {activeCaseRegistration?.status === 'registering' ? 'Registering case…' : 'Register case for team access'}
+              </button>
+              <p
+                className={`team-case-registration-message ${activeCaseRegistration?.status === 'registered' ? 'team-case-registration-success' : ''} ${activeCaseRegistration?.status === 'error' ? 'team-case-registration-error' : ''}`}
+                role={activeCaseRegistration?.status === 'error' ? 'alert' : 'status'}
+                aria-live="polite"
+              >
+                {activeCaseRegistration?.message
+                  || (!supabaseConfigured
+                    ? 'Supabase is not configured for this application.'
+                    : !authSession?.user?.id
+                      ? 'Sign in with Supabase to register this case.'
+                      : 'Registration has not been checked for this account.')}
+              </p>
+            </div>
+          )}
         </section>
 
+        {activeWorkspace === 'cases' && (
+          <section className="case-details-panel" aria-labelledby="case-details-title">
+            <div className="case-details-heading">
+              <div>
+                <p className="eyebrow">INVESTIGATION RECORD</p>
+                <h2 id="case-details-title">Case details</h2>
+                <p>Update administrative case information. Evidence, hashes, encryption, and custody records are not changed.</p>
+              </div>
+              {caseId && <span className="case-details-id">CASE ID <strong>{caseId}</strong></span>}
+            </div>
+            {!caseId ? (
+              <div className="case-details-empty">
+                <p>Open a saved case or enter an existing case ID above to review its details.</p>
+                <button type="button" className="button button-dark" onClick={() => caseInputRef.current?.focus()}>Choose a case</button>
+              </div>
+            ) : !caseDetails ? (
+              <p role="status">Loading case details…</p>
+            ) : (
+              <form className="case-details-form" onSubmit={saveActiveCaseDetails}>
+                <label htmlFor="case-title">Case Title
+                  <input id="case-title" value={caseDetails.title} onChange={(event) => setCaseDetails({ ...caseDetails, title: event.target.value })} maxLength={200} placeholder="e.g. Unauthorized access investigation" />
+                </label>
+                <label htmlFor="case-lead-investigator">Lead Investigator
+                  <input id="case-lead-investigator" value={caseDetails.leadInvestigator} onChange={(event) => setCaseDetails({ ...caseDetails, leadInvestigator: event.target.value })} maxLength={200} placeholder="Investigator name" />
+                </label>
+                <label htmlFor="case-status">Case Status
+                  <select id="case-status" value={caseDetails.status} onChange={(event) => setCaseDetails({ ...caseDetails, status: event.target.value })}>
+                    {['Open', 'In Progress', 'Under Review', 'Closed'].map((status) => <option key={status} value={status}>{status}</option>)}
+                  </select>
+                </label>
+                <label htmlFor="case-description" className="case-description-field">Case Description
+                  <textarea id="case-description" value={caseDetails.description} onChange={(event) => setCaseDetails({ ...caseDetails, description: event.target.value })} rows={5} maxLength={10000} placeholder="Record the investigation scope and context." />
+                </label>
+                <div className="case-date-grid" aria-label="Case timestamps">
+                  <div><span>Date Created</span><strong>{formatDate(caseDetails.createdAt)}</strong></div>
+                  <div><span>Date Last Updated</span><strong>{formatDate(caseDetails.updatedAt)}</strong></div>
+                </div>
+                <div className="case-details-actions">
+                  <span>Case details are encrypted in this browser’s existing vault.</span>
+                  <button type="submit" className="button button-accent" disabled={caseDetailsBusy || !db}>
+                    {caseDetailsBusy ? 'Saving…' : 'Save case details'}
+                  </button>
+                </div>
+              </form>
+            )}
+          </section>
+        )}
+
         <section className="workspace-evidence-context" aria-label="Selected evidence">
-          <strong className="workspace-active-case">{caseId || 'No case selected'}</strong>
+          <strong className="workspace-active-case" title={caseDetails?.title || caseId}>{caseDetails?.title || caseId || 'No case selected'}</strong>
           <label htmlFor="workspace-evidence">Active evidence</label>
           <select
             id="workspace-evidence"
             aria-label="Active evidence"
-            value={selectedId || ''}
+            value={activeEvidenceSelection}
             onChange={(event) => setSelectedId(event.target.value || null)}
-            disabled={!records.length}
+            disabled={!activeRecords.length}
           >
-            {!records.length && <option value="">No evidence in this case</option>}
-            {records.map((record) => <option key={record.id} value={record.id}>{record.name} · {record.id}</option>)}
+            {!activeRecords.length
+              ? <option value="">No active evidence in this case</option>
+              : !activeEvidenceSelection && <option value="">No active evidence selected</option>}
+            {activeRecords.map((record) => <option key={record.id} value={record.id}>{record.name} · {record.id}</option>)}
           </select>
           <span>{selectedRecord?.sha256 ? `SHA-256 ${selectedRecord.sha256.slice(0, 12)}…` : 'Select a case and evidence record'}</span>
         </section>
 
+        {activeWorkspace === 'overview' && (
+          <div className="dashboard-brandline" aria-label="ClueBox Odyssey — Explore the Digital Unknown">
+            <ClueBoxLogo size={38} />
+            <span><strong>ClueBox Odyssey</strong><small>Explore the Digital Unknown.</small></span>
+          </div>
+        )}
+
         {activeWorkspace === 'overview' && <section className="summary-grid" aria-label="Investigation summary">
           <article className="summary-card">
-            <span className="summary-card-icon">EV</span>
+            <span className="summary-card-icon"><Icon name="folder" size={18} /></span>
             <div><span>Evidence items</span><strong>{records.length}</strong><small>{caseId || 'Select a case to begin'}</small></div>
           </article>
           <article className="summary-card">
-            <span className="summary-card-icon">AN</span>
+            <span className="summary-card-icon"><Icon name="shield" size={18} /></span>
             <div><span>Saved analyst reviews</span><strong>{savedAnalysisCount}</strong><small>Across active case evidence</small></div>
           </article>
           <article className="summary-card">
-            <span className="summary-card-icon">TL</span>
+            <span className="summary-card-icon"><Icon name="clock" size={18} /></span>
             <div><span>Timeline events</span><strong>{timelineEvents.length}</strong><small>{timelineCaseId || 'No timeline case selected'}</small></div>
           </article>
           <article className="summary-card summary-card-status">
-            <span className="summary-card-icon">AI</span>
+            <span className="summary-card-icon"><Icon name="sparkles" size={18} /></span>
             <div><span>Copilot service</span><strong>{copilotConfigured ? 'READY' : 'OFFLINE'}</strong><small>{copilotConfigured ? 'Secure provider available' : 'Provider setup required'}</small></div>
           </article>
+        </section>}
+
+        {activeWorkspace === 'overview' && <section className="module-directory" aria-labelledby="module-directory-title">
+          <div className="module-directory-heading">
+            <div>
+              <p className="eyebrow">INVESTIGATION WORKSPACES</p>
+              <h2 id="module-directory-title">Forensic modules</h2>
+            </div>
+            <p>Choose a workspace to continue reviewing this case.</p>
+          </div>
+          <div className="module-card-grid">
+            {moduleCards.map((module) => (
+              <button
+                type="button"
+                key={module.id}
+                className="module-card"
+                data-module={module.id}
+                onClick={() => openModuleCard(module.id)}
+                aria-label={module.title}
+              >
+                <span className="module-card-icon" aria-hidden="true"><Icon name={module.icon} size={22} /></span>
+                <span className="module-card-copy">
+                  <strong>{module.title}</strong>
+                  <span>{module.description}</span>
+                </span>
+                <span className="module-card-arrow" aria-hidden="true"><Icon name="chevron" size={17} /></span>
+              </button>
+            ))}
+          </div>
         </section>}
 
         {copilotPanelOpen && appRootRef.current && createPortal(
@@ -1255,7 +1858,7 @@ function App() {
                   <>
               <fieldset className="copilot-evidence-select" disabled={copilotBusy}>
                 <legend>Evidence and saved analysis results — {caseId}</legend>
-                {!records.length ? <p>No evidence records are saved in this local case.</p> : records.map((record) => (
+                {!activeRecords.length ? <p>No active evidence records are saved in this local case.</p> : activeRecords.map((record) => (
                   <label key={record.id} className="copilot-evidence-option">
                     <input
                       type="checkbox"
@@ -1313,9 +1916,17 @@ function App() {
                       </li>
                     ))}
                   </ul>
+                  <p className="copilot-request-size" role="status" aria-live="polite">
+                    {copilotSelectedFacts.length
+                      ? copilotQuestion.trim()
+                        ? `${copilotSelectedFacts.length} selected facts will be sent in ${copilotRequestBatches.length} request${copilotRequestBatches.length === 1 ? '' : 's'}: ${copilotRequestBatches.map((batch) => `${getCopilotRequestSize(copilotQuestion, batch, caseId).toLocaleString()} bytes`).join(', ')} (maximum ${MAX_COPILOT_REQUEST_BYTES.toLocaleString()} bytes each).`
+                        : `${copilotSelectedFacts.length} facts selected. Enter a question to calculate request sizes.`
+                      : 'No facts selected. Choose the facts relevant to your question.'}
+                    {' '}Every selected fact is sent; deselected facts remain in the original local analysis and can be selected later.
+                  </p>
                   <label className="copilot-approval">
                     <input type="checkbox" checked={copilotApproved} disabled={!copilotApprovedFactIds.length} onChange={(event) => setCopilotApproved(event.target.checked)} />
-                    I reviewed the checked facts and approve sending only those selected, minimal structured facts to the secure AI service.
+                    I reviewed the checked facts and approve sending only those selected facts to the secure AI service in the request batches shown above.
                   </label>
                 </div>
               )}
@@ -1354,12 +1965,14 @@ function App() {
                         ? 'Review and approve the selected structured facts before sending.'
                         : !authSession?.access_token
                           ? 'Team sign-in and case membership are required to send a request.'
+                          : !teamCaseRegistered
+                            ? 'Register the open local case for team access before sending.'
                           : 'Only investigator-approved structured facts are sent. Ctrl/⌘ + Enter sends.'}
                   </small>
                   <button
                     type="submit"
                     className="button button-accent"
-                    disabled={copilotBusy || !caseId || !copilotApproved || !copilotApprovedFactIds.length || !copilotConfigured || !authSession?.access_token}
+                    disabled={copilotBusy || !caseId || !copilotApproved || !copilotApprovedFactIds.length || !copilotConfigured || !authSession?.access_token || !teamCaseRegistered}
                   >
                     {copilotBusy ? 'Sending…' : 'Send'}
                   </button>
@@ -1516,9 +2129,11 @@ function App() {
               <h2 id="report-title">Final Investigation Report</h2>
               <p>Generates a separate downloadable JSON report after rechecking evidence hashes and custody chains. No vault records are modified.</p>
             </div>
-            <button type="button" className="button button-accent" onClick={downloadInvestigationReport} disabled={!timelineCaseId || !timelineRecords.length || reportBusy}>
-              {reportBusy ? 'Verifying and preparing…' : 'Generate investigation report'}
-            </button>
+            <ReportExportActions
+              onDownload={downloadInvestigationReport}
+              disabled={!timelineCaseId || !timelineRecords.length}
+              busy={reportBusy}
+            />
           </div>
           <div className="report-editor">
             <label>Investigation summary
@@ -1530,12 +2145,18 @@ function App() {
           </div>
           {reportError && <p className="timeline-error" role="alert">{reportError}</p>}
           {reportNotice && <p className="report-notice" role="status">{reportNotice}</p>}
+          <SavedAnalysisReports records={records} caseId={caseId} />
         </section>}
 
         {(error || notice) && (
           <div className={`feedback ${error ? 'feedback-error' : 'feedback-success'}`} role={error ? 'alert' : 'status'}>
             <span>{error || notice}</span>
             <button type="button" className="icon-button feedback-dismiss" aria-label="Dismiss message" onClick={() => { setError(''); setNotice(''); }}><Icon name="close" size={16} /></button>
+          </div>
+        )}
+        {navigationWarning && (
+          <div className="feedback feedback-error" role="status">
+            <span>{navigationWarning}</span>
           </div>
         )}
 
@@ -1568,14 +2189,34 @@ function App() {
             )}
 
             <div className="list-toolbar">
-              <span className="list-label">CASE CONTENTS</span>
+              <div className="evidence-list-views" aria-label="Evidence record view">
+                <button
+                  type="button"
+                  aria-pressed={evidenceListView === 'active'}
+                  onClick={() => {
+                    setEvidenceListView('active');
+                    if (selectedRecord?.archivedAt) setSelectedId(activeRecords[0]?.id ?? null);
+                  }}
+                >
+                  Active evidence ({activeRecords.length})
+                </button>
+                {canManageCaseEvidence && (
+                  <button
+                    type="button"
+                    aria-pressed={evidenceListView === 'archived'}
+                    onClick={openArchivedEvidence}
+                  >
+                    Archived evidence ({archivedRecords.length})
+                  </button>
+                )}
+              </div>
               <label className="search-box">
                 <Icon name="search" size={16} />
                 <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search files or hash" aria-label="Search evidence" />
               </label>
             </div>
 
-            {records.length > 0 ? (
+            {visibleEvidenceRecords.length > 0 ? (
               filteredRecords.length > 0 ? (
                 <div className="evidence-list">
                   <div className="list-head"><span>FILE</span><span>ADDED</span><span>SHA-256</span><span>STATUS</span></div>
@@ -1584,11 +2225,16 @@ function App() {
                       <span className="file-cell"><span className="file-icon"><Icon name="file" size={17} /></span><span className="file-name-wrap"><strong>{record.name}</strong><small>{formatBytes(record.size)} <span className="file-type">{record.type || 'Unknown type'}</span></small></span></span>
                       <span className="date-cell">{formatDate(record.createdAt)}</span>
                       <span className="hash-cell">{record.sha256.slice(0, 12)}…</span>
-                      <span className="status-cell"><span className="status-mark"><Icon name="check" size={12} /></span> Secured</span>
+                      <span className="status-cell"><span className="status-mark"><Icon name="check" size={12} /></span> {record.archivedAt ? 'Archived' : 'Secured'}</span>
                     </button>
                   ))}
                 </div>
               ) : <div className="empty-search">No evidence matches “{query}”.</div>
+            ) : records.length > 0 ? (
+              <div className="detail-placeholder">
+                <h3>No {evidenceListView} evidence</h3>
+                <p>{evidenceListView === 'archived' ? 'Archived evidence will appear here for authorized case investigators.' : 'All evidence in this case is archived.'}</p>
+              </div>
             ) : (
               <div className="empty-state">
                 <div className="empty-art"><span><Icon name="file" size={23} /></span><i /><i /></div>
@@ -1602,6 +2248,12 @@ function App() {
           <section className="detail-column" aria-label={analysisWorkspace ? `${workspaces[activeWorkspace][0]} workspace` : 'Evidence details'} hidden={activeWorkspace !== 'evidence' && !analysisWorkspace}>
             {selectedRecord ? (
               <>
+                {selectedRecord.archivedAt && (
+                  <div className="archived-evidence-notice" role="status">
+                    <strong>Archived evidence — historical review only</strong>
+                    <span>Archived {formatDate(selectedRecord.archivedAt)} by {selectedRecord.archive?.analyst || 'unknown analyst'}.</span>
+                  </div>
+                )}
                 <div className="detail-heading" hidden={analysisWorkspace}>
                   <div className="detail-title-wrap"><span className="detail-file-icon"><Icon name="file" size={19} /></span><div><p className="eyebrow">EVIDENCE RECORD</p><h2 title={selectedRecord.name}>{selectedRecord.name}</h2></div></div>
                   <button type="button" className="icon-button download-button" onClick={handleDownload} aria-label="Decrypt and download evidence" title="Decrypt and download"><Icon name="download" size={18} /></button>
@@ -1632,6 +2284,119 @@ function App() {
                   {selectedRecord.exif && <p className="exif-disclaimer">EXIF values are embedded in the file and may be absent, inaccurate, or altered.</p>}
                 </div>
 
+                <section className="evidence-management-section" aria-label="Evidence archive and replacement" hidden={analysisWorkspace}>
+                  <div className="detail-section-title"><h3>Evidence status</h3><span>{selectedRecord.archivedAt ? 'ARCHIVED' : 'ACTIVE'}</span></div>
+                  {selectedRecord.archivedAt ? (
+                    <>
+                      <p className="evidence-management-copy">
+                        {selectedRecord.archive?.action === 'replaced' ? 'Replaced' : 'Removed from the active case'} by {selectedRecord.archive?.analyst || 'unknown analyst'}.
+                        {selectedRecord.archive?.reason ? ` Reason: ${selectedRecord.archive.reason}` : ''}
+                      </p>
+                      {(selectedRecord.replacementEvidenceId || selectedRecord.replacement?.originalEvidenceId) && (
+                        <button
+                          type="button"
+                          className="text-button evidence-related-link"
+                          onClick={() => setSelectedId(
+                            selectedRecord.replacementEvidenceId || selectedRecord.replacement?.originalEvidenceId,
+                          )}
+                        >
+                          {selectedRecord.replacementEvidenceId
+                            ? `Review replacement evidence ${selectedRecord.replacementEvidenceId}`
+                            : `Review original evidence ${selectedRecord.replacement.originalEvidenceId}`}
+                        </button>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      {selectedRecord.replacement?.originalEvidenceId && (
+                        <button
+                          type="button"
+                          className="text-button evidence-related-link"
+                          onClick={() => setSelectedId(selectedRecord.replacement.originalEvidenceId)}
+                        >
+                          Replacement for evidence {selectedRecord.replacement.originalEvidenceId}
+                        </button>
+                      )}
+                      {canManageCaseEvidence ? (
+                        <div className="evidence-management-actions">
+                          <button type="button" className="button button-dark" onClick={() => openEvidenceAction('archive')} disabled={busy}>
+                            Remove from Case
+                          </button>
+                          <button type="button" className="button button-accent" onClick={() => openEvidenceAction('replace')} disabled={busy}>
+                            Replace Evidence
+                          </button>
+                        </div>
+                      ) : (
+                        <p className="evidence-management-copy" role="status">
+                          Sign in and register this case with an Admin or Investigator role to archive or replace evidence.
+                        </p>
+                      )}
+                    </>
+                  )}
+                  {evidenceAction && (
+                    <div className="evidence-action-backdrop">
+                      <form
+                        className="evidence-action-dialog"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="evidence-action-title"
+                        onSubmit={confirmEvidenceAction}
+                      >
+                        <h2 id="evidence-action-title">
+                          {evidenceAction === 'replace' ? 'Confirm Evidence Replacement' : 'Confirm Remove from Case'}
+                        </h2>
+                        <p>
+                          {evidenceAction === 'replace'
+                            ? 'The replacement will be stored as a new encrypted evidence record. The original will be archived with its hash, file, reports, and custody history intact.'
+                            : 'This archives the record from the active case view. Its encrypted file, SHA-256, reports, and custody history will be retained.'}
+                        </p>
+                        <label htmlFor="evidence-action-analyst">Analyst</label>
+                        <input
+                          id="evidence-action-analyst"
+                          value={evidenceActionAnalyst}
+                          onChange={(event) => setEvidenceActionAnalyst(event.target.value)}
+                          maxLength={200}
+                          required
+                        />
+                        {supabaseConfigured && authSession?.user?.email && (
+                          <small>Signed in as {authSession.user.email}; user ID will be recorded in the audit event.</small>
+                        )}
+                        {evidenceAction === 'replace' && (
+                          <>
+                            <label htmlFor="replacement-evidence-file">Replacement evidence file</label>
+                            <input
+                              id="replacement-evidence-file"
+                              type="file"
+                              required
+                              onChange={(event) => setReplacementFile(event.target.files?.[0] || null)}
+                            />
+                          </>
+                        )}
+                        <label htmlFor="evidence-action-reason">Reason (required)</label>
+                        <textarea
+                          id="evidence-action-reason"
+                          value={evidenceActionReason}
+                          onChange={(event) => setEvidenceActionReason(event.target.value)}
+                          maxLength={5000}
+                          rows={3}
+                          required
+                        />
+                        <div className="evidence-action-buttons">
+                          <button type="button" className="button button-dark" onClick={closeEvidenceAction} disabled={busy}>Cancel</button>
+                          <button
+                            type="submit"
+                            className="button button-accent"
+                            disabled={busy || !evidenceActionAnalyst.trim() || !evidenceActionReason.trim()
+                              || (evidenceAction === 'replace' && !replacementFile)}
+                          >
+                            {busy ? 'Recording…' : `Confirm ${evidenceAction === 'replace' ? 'Replace Evidence' : 'Remove from Case'}`}
+                          </button>
+                        </div>
+                      </form>
+                    </div>
+                  )}
+                </section>
+
                 <section className="exif-validation-section" aria-label="EXIF analysis and manual validation" hidden={activeWorkspace !== 'exif'}>
                   <div className="detail-section-title">
                     <h3>Manual EXIF validation</h3>
@@ -1659,7 +2424,7 @@ function App() {
                     <textarea id="exif-notes" value={exifNotes} onChange={(event) => setExifNotes(event.target.value)} rows="3" />
                     <label htmlFor="exif-artifact-references">Artifact references</label>
                     <textarea id="exif-artifact-references" value={exifArtifactReferences} onChange={(event) => setExifArtifactReferences(event.target.value)} rows="2" placeholder="One reference per line" />
-                    <button type="submit" className="button button-dark" disabled={busy || !exifAnalyst.trim()}>Save validation</button>
+                    <button type="submit" className="button button-dark" disabled={busy || !exifAnalyst.trim() || Boolean(selectedRecord.archivedAt)}>Save validation</button>
                   </form>
                   {selectedRecord.exifValidation?.artifactReferences.length > 0 && (
                     <ul className="artifact-reference-list" aria-label="Saved artifact references">
@@ -1674,34 +2439,12 @@ function App() {
                     <span>OFFLINE HIVE</span>
                   </div>
                   <p className="registry-analysis-copy">Analyze a REGF hive locally. Analysis reads a verified copy and does not change the original evidence or SHA-256.</p>
-                  <button type="button" className="button button-dark" onClick={analyzeRegistryHive} disabled={busy}>
+                  <button type="button" className="button button-dark" onClick={analyzeRegistryHive} disabled={busy || Boolean(selectedRecord.archivedAt)}>
                     {busy ? 'Analyzing…' : 'Analyze selected evidence'}
                   </button>
                   {registryReport && (
                     <>
-                      <div className="registry-analysis-summary">
-                        <strong>{registryReport.hiveType}</strong>
-                        <span>{registryReport.keyCount.toLocaleString()} keys · {registryReport.artifacts.length} artifacts</span>
-                      </div>
-                      {registryReport.warnings.map((warning) => <p className="registry-warning" key={warning}>{warning}</p>)}
-                      {registryReport.artifacts.length ? (
-                        <ul className="registry-artifact-list">
-                          {registryReport.artifacts.map((item, index) => (
-                            <li key={`${item.keyPath}-${item.type}-${index}`}>
-                              <strong>{item.type}</strong>
-                              <code>{item.keyPath}</code>
-                              <ul>
-                                {item.values.map((entry, valueIndex) => (
-                                  <li key={`${entry.name}-${valueIndex}`}>
-                                    <span>{entry.name}: </span>
-                                    <code>{typeof entry.data === 'object' ? JSON.stringify(entry.data) : String(entry.data)}</code>
-                                  </li>
-                                ))}
-                              </ul>
-                            </li>
-                          ))}
-                        </ul>
-                      ) : <p className="registry-analysis-copy">No supported artifacts were found in this hive.</p>}
+                      <RegistryAnalysisResults report={registryReport} evidence={selectedRecord} />
                       <form className="exif-validation-form" onSubmit={saveRegistryReport}>
                         <label htmlFor="registry-validation-status">Analyst validation</label>
                         <select id="registry-validation-status" value={registryValidationStatus} onChange={(event) => setRegistryValidationStatus(event.target.value)}>
@@ -1715,7 +2458,7 @@ function App() {
                         <textarea id="registry-notes" value={registryNotes} onChange={(event) => setRegistryNotes(event.target.value)} rows="3" />
                         <label htmlFor="registry-artifact-references">Artifact references</label>
                         <textarea id="registry-artifact-references" value={registryArtifactReferences} onChange={(event) => setRegistryArtifactReferences(event.target.value)} rows="2" placeholder="One reference per line" />
-                        <button type="submit" className="button button-dark" disabled={busy || !registryAnalyst.trim()}>Save analysis report</button>
+                        <button type="submit" className="button button-dark" disabled={busy || !registryAnalyst.trim() || Boolean(selectedRecord.archivedAt)}>Save analysis report</button>
                       </form>
                     </>
                   )}
@@ -1734,7 +2477,7 @@ function App() {
                     <span>LOCAL ANALYSIS</span>
                   </div>
                   <p className="registry-analysis-copy">Analyze classic PCAP or PCAPNG locally from a hash-verified copy. Original evidence bytes and SHA-256 are preserved.</p>
-                  <button type="button" className="button button-dark" onClick={analyzePcap} disabled={busy}>
+                  <button type="button" className="button button-dark" onClick={analyzePcap} disabled={busy || Boolean(selectedRecord.archivedAt)}>
                     {busy ? 'Analyzing…' : 'Analyze selected capture'}
                   </button>
                   {pcapReport && (
@@ -1807,7 +2550,7 @@ function App() {
                         <textarea id="pcap-notes" value={pcapNotes} onChange={(event) => setPcapNotes(event.target.value)} rows="3" />
                         <label htmlFor="pcap-artifact-references">Artifact references</label>
                         <textarea id="pcap-artifact-references" value={pcapArtifactReferences} onChange={(event) => setPcapArtifactReferences(event.target.value)} rows="2" placeholder="One reference per line" />
-                        <button type="submit" className="button button-dark" disabled={busy || !pcapAnalyst.trim()}>Save analysis report</button>
+                        <button type="submit" className="button button-dark" disabled={busy || !pcapAnalyst.trim() || Boolean(selectedRecord.archivedAt)}>Save analysis report</button>
                       </form>
                     </>
                   )}
@@ -1827,7 +2570,7 @@ function App() {
                     <span>READ ONLY · LOCAL</span>
                   </div>
                   <p className="registry-analysis-copy">Analyze a hash-verified copy in an in-memory, query-only database. Source evidence and its SHA-256 are preserved.</p>
-                  <button type="button" className="button button-dark" onClick={analyzeSqliteDatabase} disabled={busy}>
+                  <button type="button" className="button button-dark" onClick={analyzeSqliteDatabase} disabled={busy || Boolean(selectedRecord.archivedAt)}>
                     {busy ? 'Analyzing…' : 'Analyze selected database'}
                   </button>
                   {sqliteReport && (
@@ -1900,7 +2643,7 @@ function App() {
                         <textarea id="sqlite-notes" value={sqliteNotes} onChange={(event) => setSqliteNotes(event.target.value)} rows="3" />
                         <label htmlFor="sqlite-artifact-references">Artifact references</label>
                         <textarea id="sqlite-artifact-references" value={sqliteArtifactReferences} onChange={(event) => setSqliteArtifactReferences(event.target.value)} rows="2" placeholder="One reference per line" />
-                        <button type="submit" className="button button-dark" disabled={busy || !sqliteAnalyst.trim()}>Save analysis report</button>
+                        <button type="submit" className="button button-dark" disabled={busy || !sqliteAnalyst.trim() || Boolean(selectedRecord.archivedAt)}>Save analysis report</button>
                       </form>
                     </>
                   )}
@@ -1919,7 +2662,19 @@ function App() {
                     {selectedRecord.custody.slice().reverse().map((entry) => (
                       <li key={entry.eventHash}>
                         <span className="timeline-dot"><Icon name="clock" size={13} /></span>
-                        <div className="event-copy"><strong>{entry.action}</strong><span>{entry.actor}</span><time dateTime={entry.timestamp}>{formatDate(entry.timestamp)}</time><code>{entry.eventHash.slice(0, 16)}…</code></div>
+                        <div className="event-copy">
+                          <strong>{entry.action}</strong>
+                          <span>{entry.actor}</span>
+                          <time dateTime={entry.timestamp}>{formatDate(entry.timestamp)}</time>
+                          {entry.details && (
+                            <small className="evidence-audit-details">
+                              {entry.details.reason && `Reason: ${entry.details.reason}`}
+                              {entry.details.originalEvidenceId && ` · Original ID: ${entry.details.originalEvidenceId}`}
+                              {entry.details.replacementEvidenceId && ` · Replacement ID: ${entry.details.replacementEvidenceId}`}
+                            </small>
+                          )}
+                          <code>{entry.eventHash.slice(0, 16)}…</code>
+                        </div>
                       </li>
                     ))}
                   </ol>
@@ -1932,7 +2687,7 @@ function App() {
                         <option>Evidence accessed</option>
                         <option>Evidence returned to storage</option>
                       </select>
-                      <button type="submit" className="icon-button record-event-button" disabled={busy || !custodian.trim()} aria-label="Record custody event" title="Record custody event"><Icon name="plus" size={17} /></button>
+                      <button type="submit" className="icon-button record-event-button" disabled={busy || !custodian.trim() || Boolean(selectedRecord.archivedAt)} aria-label="Record custody event" title="Record custody event"><Icon name="plus" size={17} /></button>
                     </div>
                   </form>
                 </div>
@@ -1953,6 +2708,24 @@ function App() {
         </footer>
       </main>
       </div>
+      <button
+        ref={copilotLauncherRef}
+        type="button"
+        className="copilot-floating-launcher"
+        aria-label={copilotPanelOpen ? 'Close AI Copilot chat' : 'Open AI Copilot chat'}
+        aria-controls="copilot-chat-panel"
+        aria-expanded={copilotPanelOpen}
+        title={copilotPanelOpen ? 'Close AI Forensic Copilot' : 'Open AI Forensic Copilot'}
+        onClick={() => {
+          if (copilotPanelOpen) closeCopilotPanel();
+          else {
+            setCopilotPanelMinimized(false);
+            setCopilotPanelOpen(true);
+          }
+        }}
+      >
+        <Icon name="sparkles" size={25} />
+      </button>
     </div>
   );
 }

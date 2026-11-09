@@ -1,19 +1,20 @@
 :root {
   font-family: Inter, 'Avenir Next', Avenir, 'Segoe UI', sans-serif;
-  color: #e2edf0;
-  background: #071317;
+  color: #f8fafc;
+  background: #0b1020;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  --ink: #e2edf0;
-  --paper: #071317;
-  --surface: #0e1e23;
-  --surface-raised: #13272d;
-  --surface-border: #203a41;
-  --text-muted: #9ab0b6;
-  --teal: #37c6b0;
-  --teal-bright: #5de0cb;
+  --ink: #f8fafc;
+  --paper: #0b1020;
+  --surface: #111a2e;
+  --surface-raised: #18243b;
+  --surface-border: #293753;
+  --text-muted: #aebbd0;
+  --teal: #22d3ee;
+  --teal-bright: #67e8f9;
+  --cosmic-purple: #8b5cf6;
   --amber: #f1b85b;
   --danger: #ff8179;
 }
@@ -28,4 +29,4 @@ html {
 
 body { min-width: 320px; min-height: 100vh; margin: 0; }
 button, input, select { font: inherit; }
-button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--teal-bright); outline-offset: 2px; }
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--teal-bright); outline-offset: 3px; }

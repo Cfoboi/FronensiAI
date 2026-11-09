@@ -32,7 +32,7 @@ const CASE_ID = 'E2E-SYNTHETIC-CASE-ONLY';
 const encoder = new TextEncoder();
 
 function createMemoryVault() {
-  const stores = { records: new Map(), keys: new Map() };
+  const stores = { records: new Map(), keys: new Map(), cases: new Map() };
   return {
     stores,
     transaction() {
@@ -42,8 +42,9 @@ function createMemoryVault() {
         return {
           put(value) {
             return createRequest(() => {
-              store.set(value.id, value);
-              return value.id;
+              const key = value.id || value.caseId;
+              store.set(key, value);
+              return key;
             }, transaction);
           },
           get(key) {

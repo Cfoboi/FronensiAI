@@ -3,7 +3,7 @@ export const COPILOT_VALIDATION_STATUSES = ['VERIFIED', 'MISMATCH', 'NEEDS REVIE
 const MAX_QUESTION_LENGTH = 2_000;
 const MAX_FACTS = 100;
 const MAX_VALUE_LENGTH = 500;
-const MAX_REQUEST_BYTES = 20_000;
+export const MAX_COPILOT_REQUEST_BYTES = 20_000;
 const MAX_RESPONSE_BYTES = 64_000;
 const REQUEST_TIMEOUT_MS = 25_000;
 
@@ -207,14 +207,64 @@ export function validateCopilotResponse(response, facts) {
   };
 }
 
-export function validateCopilotQuestion(question, facts) {
+export function validateCopilotQuestion(question, facts, caseNumber = '') {
   if (typeof question !== 'string' || !question.trim()) throw new Error('Enter an investigation question.');
   if (question.trim().length > MAX_QUESTION_LENGTH) throw new Error('The question must be 2,000 characters or fewer.');
   const request = { question: question.trim(), facts };
-  if (new TextEncoder().encode(JSON.stringify(request)).length > MAX_REQUEST_BYTES) {
+  if (getCopilotRequestSize(request.question, facts, caseNumber) > MAX_COPILOT_REQUEST_BYTES) {
     throw new Error('Selected evidence facts exceed the 20 KB Copilot request limit.');
   }
   return request;
+}
+
+export function getCopilotRequestSize(question, facts, caseNumber = '') {
+  return new TextEncoder().encode(JSON.stringify({
+    action: 'ask',
+    caseNumber,
+    question: question.trim(),
+    facts,
+  })).byteLength;
+}
+
+export function partitionCopilotFacts(question, facts, caseNumber = '') {
+  const validatedQuestion = validateCopilotQuestion(question, [], caseNumber).question;
+  if (!Array.isArray(facts) || !facts.length) throw new Error('Select at least one evidence fact.');
+
+  const batches = [];
+  let batch = [];
+  for (const fact of facts) {
+    const candidate = [...batch, fact];
+    if (getCopilotRequestSize(validatedQuestion, candidate, caseNumber) <= MAX_COPILOT_REQUEST_BYTES) {
+      batch = candidate;
+      continue;
+    }
+
+    if (!batch.length) {
+      throw new Error(`Evidence fact ${fact.referenceId || '(unknown)'} exceeds the 20 KB request limit and was not included.`);
+    }
+    batches.push(batch);
+    batch = [fact];
+    if (getCopilotRequestSize(validatedQuestion, batch, caseNumber) > MAX_COPILOT_REQUEST_BYTES) {
+      throw new Error(`Evidence fact ${fact.referenceId || '(unknown)'} exceeds the 20 KB request limit and was not included.`);
+    }
+  }
+  if (batch.length) batches.push(batch);
+  return batches;
+}
+
+export function combineCopilotResponses(responses) {
+  if (!Array.isArray(responses) || !responses.length) {
+    throw new Error('No Copilot batch responses are available to combine.');
+  }
+  return {
+    observedEvidence: responses.flatMap((response) => response.observedEvidence),
+    interpretations: responses.flatMap((response) => response.interpretations),
+    investigativeLeads: responses.flatMap((response) => response.investigativeLeads),
+    recommendations: responses.flatMap((response) => response.recommendations),
+    unsupportedClaims: responses.flatMap((response) => response.unsupportedClaims),
+    insufficientEvidence: responses.some((response) => response.insufficientEvidence),
+    validationStatus: 'NEEDS REVIEW',
+  };
 }
 
 async function responseJson(response) {
@@ -253,7 +303,11 @@ export async function callCopilot({
     });
     const data = await responseJson(response);
     if (!response.ok) {
-      if (response.status === 401 || response.status === 403) throw new Error('Access denied. Sign in and confirm your case membership.');
+      if (response.status === 401 || response.status === 403) {
+        throw new Error(typeof data.error === 'string'
+          ? data.error
+          : 'Access denied. Sign in and confirm your case membership.');
+      }
       if (response.status === 503) throw new Error(COPILOT_UNAVAILABLE_MESSAGE);
       throw new Error(typeof data.error === 'string' ? data.error : 'The AI service request failed.');
     }
@@ -266,8 +320,8 @@ export async function callCopilot({
   }
 }
 
-export function makeCopilotQuestion(question, facts) {
-  const validated = validateCopilotQuestion(question, facts);
+export function makeCopilotQuestion(question, facts, caseNumber = '') {
+  const validated = validateCopilotQuestion(question, facts, caseNumber);
   return {
     action: 'ask',
     question: validated.question,

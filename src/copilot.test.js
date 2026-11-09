@@ -2,8 +2,12 @@ import { expect, test } from 'vitest';
 import {
   buildCopilotEvidenceContext,
   callCopilot,
+  combineCopilotResponses,
   COPILOT_UNAVAILABLE_MESSAGE,
+  getCopilotRequestSize,
   makeCopilotQuestion,
+  MAX_COPILOT_REQUEST_BYTES,
+  partitionCopilotFacts,
   validateCopilotResponse,
 } from './copilot';
 
@@ -122,6 +126,65 @@ test('keeps malicious evidence text as bounded evidence data rather than instruc
   expect(JSON.stringify(request)).not.toMatch(/privateKey|passphrase|ciphertext/i);
 });
 
+test('partitions a large fact selection into bounded requests without dropping or changing facts', () => {
+  const facts = Array.from({ length: 38 }, (_, index) => ({
+    referenceId: `E${index + 1}`,
+    caseId: 'TEST-ONLY',
+    evidenceId: 'sqlite-evidence',
+    filename: 'database.sqlite',
+    sha256: 'b'.repeat(64),
+    integrityStatus: 'SHA-256 verified',
+    custodyStatus: 'custody chain verified',
+    validationStatus: 'NEEDS REVIEW',
+    module: 'SQLite',
+    artifactType: index % 2 ? 'Database record' : 'Database schema',
+    artifactReference: `table_${index}`,
+    value: `${index}: ${'synthetic analysis value '.repeat(18)}`,
+  }));
+  const question = 'Review these SQLite findings.';
+  const caseNumber = 'TEST-ONLY';
+  const batches = partitionCopilotFacts(question, facts, caseNumber);
+
+  expect(batches.length).toBeGreaterThan(1);
+  expect(batches.flat()).toEqual(facts);
+  expect(batches.flat().map((fact) => fact.referenceId)).toEqual(facts.map((fact) => fact.referenceId));
+  expect(batches.every((batch) => getCopilotRequestSize(question, batch, caseNumber) <= MAX_COPILOT_REQUEST_BYTES)).toBe(true);
+  expect(batches.flat().every((fact) => fact.sha256 === facts[0].sha256)).toBe(true);
+});
+
+test('rejects a single oversized fact rather than truncating it', () => {
+  const fact = {
+    referenceId: 'E1',
+    value: 'original-analysis-value '.repeat(2_000),
+  };
+  const originalValue = fact.value;
+
+  expect(() => partitionCopilotFacts('Review this finding.', [fact], 'TEST-ONLY')).toThrow(/exceeds the 20 KB request limit and was not included/i);
+  expect(fact.value).toBe(originalValue);
+});
+
+test('combines validated batch results while retaining observations and citations', () => {
+  const firstFact = { referenceId: 'E1', module: 'SQLite', value: 'schema' };
+  const secondFact = { referenceId: 'E2', module: 'SQLite', value: 'record' };
+  const first = validateCopilotResponse({
+    interpretations: [{ text: 'Schema requires review.', evidenceRefs: ['E1'] }],
+    investigativeLeads: [],
+    recommendations: [],
+  }, [firstFact]);
+  const second = validateCopilotResponse({
+    interpretations: [],
+    investigativeLeads: [{ text: 'Compare this record with another source.', evidenceRefs: ['E2'] }],
+    recommendations: [],
+    insufficientEvidence: true,
+  }, [secondFact]);
+  const combined = combineCopilotResponses([first, second]);
+
+  expect(combined.observedEvidence).toEqual([firstFact, secondFact]);
+  expect(combined.interpretations[0].evidenceRefs).toEqual(['E1']);
+  expect(combined.investigativeLeads[0].evidenceRefs).toEqual(['E2']);
+  expect(combined.insufficientEvidence).toBe(true);
+});
+
 test('requires authentication and reports missing secure provider configuration', async () => {
   await expect(callCopilot({ action: 'status' })).rejects.toThrow(COPILOT_UNAVAILABLE_MESSAGE);
   await expect(callCopilot({
@@ -157,6 +220,39 @@ test('rejects unauthorized case access and reports AI service errors', async () 
     action: 'ask',
     fetchImpl: failedFetch,
   })).rejects.toThrow(/AI provider request failed/i);
+});
+
+test('preserves safe authorization errors and sends the user JWT with the case number', async () => {
+  const fetchImpl = vi.fn(async (_url, options) => {
+    expect(options.headers.Authorization).toBe('Bearer synthetic-user-token');
+    expect(JSON.parse(options.body)).toMatchObject({
+      action: 'ask',
+      caseNumber: 'TEST-ONLY',
+    });
+    return new Response(JSON.stringify({ error: 'Case authorization could not be verified.' }), { status: 500 });
+  });
+
+  await expect(callCopilot({
+    supabaseUrl: 'https://example.supabase.co',
+    publishableKey: 'public-test-key',
+    accessToken: 'synthetic-user-token',
+    action: 'ask',
+    payload: { caseNumber: 'TEST-ONLY', question: 'Review the evidence.', facts: [] },
+    fetchImpl,
+  })).rejects.toThrow('Case authorization could not be verified.');
+
+  const forbiddenFetch = async () => new Response(
+    JSON.stringify({ error: 'Case not found or unavailable to this account.' }),
+    { status: 403 },
+  );
+  await expect(callCopilot({
+    supabaseUrl: 'https://example.supabase.co',
+    publishableKey: 'public-test-key',
+    accessToken: 'synthetic-user-token',
+    action: 'ask',
+    payload: { caseNumber: 'TEST-ONLY' },
+    fetchImpl: forbiddenFetch,
+  })).rejects.toThrow('Case not found or unavailable to this account.');
 });
 
 test('times out requests and rejects an oversized or empty question', async () => {
